@@ -31,7 +31,7 @@ process RFIFIND {
     label 'presto'
     label 'process_medium'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/01_RFIFIND", mode: 'copy'
+    publishDir "${params.outdir}/${observation.baseName}/01_RFIFIND", mode: 'copy'
 
     input:
     path observation
@@ -60,6 +60,7 @@ process PREPDATA {
     label 'presto'
     label 'process_high'
     container "${params.presto_container}"
+    publishDir "${params.outdir}/${observation.baseName}/02_TIMESERIES", mode: 'copy', enabled: params.publish_timeseries
     maxForks 2
 
     input:
@@ -70,12 +71,47 @@ process PREPDATA {
 
     script:
     basename = observation.baseName
-    dm_str = String.format("%.2f", dm).replace('.', 'p')
+    dm_str = String.format("%.2f", dm as Double)  // Keep decimal point for PRESTO sifting compatibility
     nobary_flag = nobary ? "-nobary" : ""
     // Find the mask file from rfi_products
     mask_file = rfi_products.find { it.name.endsWith('.mask') }
     """
     prepdata ${nobary_flag} -dm ${dm} -downsamp ${downsample} -mask ${mask_file} ${extra_flags} -o ${basename}_DM${dm_str} ${observation}
+    """
+}
+
+process SPLIT_DATFILE {
+    tag "${datfile.baseName}_${segment_name}_${chunk_num}"
+    label 'presto'
+    container "${params.presto_container}"
+
+    input:
+    tuple val(dm), path(datfile), path(inffile), val(segment_name), val(fraction), val(chunk_num), val(total_chunks)
+
+    output:
+    tuple val(dm), val(segment_name), val(chunk_num), path("*_${segment_name}_*.dat"), path("*_${segment_name}_*.inf"), emit: segments
+
+    script:
+    basename = datfile.baseName
+    """
+    #!/bin/bash
+
+    # Read number of samples from .inf file
+    num_samples=\$(grep "Number of bins in the time series" ${inffile} | awk -F'=' '{print \$2}' | tr -d ' ')
+
+    # Calculate samples per segment (using awk instead of bc)
+    samples_per_chunk=\$(awk "BEGIN {printf \\"%.0f\\", \$num_samples * ${fraction}}")
+
+    # Ensure even number of samples
+    if [ \$((samples_per_chunk % 2)) -ne 0 ]; then
+        samples_per_chunk=\$((samples_per_chunk - 1))
+    fi
+
+    # Calculate starting fraction (prepdata -start expects fraction, not sample number)
+    start_fraction=\$(awk "BEGIN {printf \\"%.6f\\", (${chunk_num} - 1) * ${fraction}}")
+
+    # Use prepdata to split the file (it will create the .inf automatically)
+    prepdata -nobary -dm 0 -start \$start_fraction -numout \$samples_per_chunk -o ${basename}_${segment_name}_${chunk_num} ${datfile}
     """
 }
 
@@ -128,7 +164,7 @@ process ZAPBIRDS {
     tag "${fftfile.baseName}"
     label 'presto'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/02_BIRDIES", mode: 'copy', pattern: "*.zaplist"
+    publishDir "${params.outdir}/${fftfile.name.split('_DM')[0]}/02_BIRDIES", mode: 'copy', pattern: "*.zaplist"
 
     input:
     tuple val(dm), path(fftfile), path(inffile)
@@ -156,7 +192,7 @@ process ACCELSEARCH_ZMAX0 {
     label 'presto'
     label 'process_low'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/02_BIRDIES", mode: 'copy', pattern: "*_ACCEL_0.cand"
+    publishDir "${params.outdir}/${fftfile.name.split('_DM')[0]}/02_BIRDIES", mode: 'copy', pattern: "*_ACCEL_0.cand"
 
     input:
     tuple val(dm), path(fftfile), path(inffile)
@@ -180,7 +216,22 @@ process ACCELSEARCH {
     label 'presto'
     label 'process_high'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/03_DEDISPERSION", mode: 'copy', pattern: "*_ACCEL_*"
+    publishDir {
+        def obs_name = fftfile.name.split('_DM')[0]
+        // Extract segment label from filename (e.g., _half_1 or _full)
+        def segment_label = 'full'
+        if (fftfile.name.contains('_half_')) {
+            def chunk = fftfile.name.split('_half_')[1].split('_')[0]
+            segment_label = "half_${chunk}"
+        } else if (fftfile.name.contains('_quarter_')) {
+            def chunk = fftfile.name.split('_quarter_')[1].split('_')[0]
+            segment_label = "quarter_${chunk}"
+        } else if (fftfile.name.contains('_third_')) {
+            def chunk = fftfile.name.split('_third_')[1].split('_')[0]
+            segment_label = "third_${chunk}"
+        }
+        "${params.outdir}/${obs_name}/03_DEDISPERSION/${segment_label}"
+    }, mode: 'copy', pattern: "*_ACCEL_*"
 
     input:
     tuple val(dm), path(fftfile), path(inffile)
@@ -191,7 +242,7 @@ process ACCELSEARCH {
     val extra_flags
 
     output:
-    tuple val(dm), val(zmax), val(wmax), path("*_ACCEL_${zmax}"), path("*_ACCEL_${zmax}.cand"), emit: candidates
+    tuple val(dm), val(zmax), val(wmax), path("*_ACCEL_${zmax}"), path("*_ACCEL_${zmax}.cand"), path(inffile), emit: candidates
 
     script:
     cuda_flag = use_cuda ? "-cuda ${gpu_id}" : ""
@@ -206,40 +257,91 @@ process ACCELSEARCH {
 // ============================================================================
 
 process ACCELSIFT {
-    tag "sift_DM${dm}"
+    tag "sift_z${zmax}_w${wmax}"
     label 'presto'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/04_SIFTING", mode: 'copy'
+
+    // Extract observation basename and segment from first accel file
+    publishDir {
+        def first_file = accel_files instanceof List ? accel_files[0] : accel_files
+        def obs_name = first_file.name.split('_DM')[0]
+        // Extract segment label from filename (e.g., _half_1 or _full)
+        def segment_label = 'full'
+        if (first_file.name.contains('_half_')) {
+            def chunk = first_file.name.split('_half_')[1].split('_')[0]
+            segment_label = "half_${chunk}"
+        } else if (first_file.name.contains('_quarter_')) {
+            def chunk = first_file.name.split('_quarter_')[1].split('_')[0]
+            segment_label = "quarter_${chunk}"
+        } else if (first_file.name.contains('_third_')) {
+            def chunk = first_file.name.split('_third_')[1].split('_')[0]
+            segment_label = "third_${chunk}"
+        }
+        "${params.outdir}/${obs_name}/04_SIFTING/${segment_label}"
+    }, mode: 'copy', pattern: "*.txt"
 
     input:
-    tuple val(dm), path(accel_files), path(cand_files)
+    tuple val(zmax), val(wmax), path(accel_files)
     val sigma_threshold
+    val period_min
+    val period_max
+    val flag_remove_duplicates
+    val flag_remove_harmonics
 
     output:
-    tuple val(dm), path("*.sift"), path("*.cands"), emit: sifted_candidates
+    path "best_candidates_z${zmax}_w${wmax}.txt", emit: sifted_candidates
+    path "fold_params_z${zmax}_w${wmax}.txt", emit: fold_params
+
+    script:
+    wmax_suffix = wmax > 0 ? "_JERK_${wmax}" : ""
+    dup_flag = flag_remove_duplicates ? "--remove-duplicates" : ""
+    harm_flag = flag_remove_harmonics ? "--remove-harmonics" : ""
+    """
+    # Find all ACCEL files for this zmax/wmax combination
+    accel_list=(*_ACCEL_${zmax}${wmax_suffix})
+
+    if [ \${#accel_list[@]} -eq 0 ]; then
+        echo "No candidates found" > best_candidates_z${zmax}_w${wmax}.txt
+        touch fold_params_z${zmax}_w${wmax}.txt
+        exit 0
+    fi
+
+    # Run custom sifting script
+    ${projectDir}/bin/sift_candidates.py \
+        \${accel_list[@]} \
+        --min-period ${period_min} \
+        --max-period ${period_max} \
+        --sigma-threshold ${sigma_threshold} \
+        ${dup_flag} \
+        ${harm_flag} \
+        --max-cands-to-fold ${params.max_cands_to_fold} \
+        --output best_candidates_z${zmax}_w${wmax}.txt \
+        --fold-params fold_params_z${zmax}_w${wmax}.txt
+    """
+}
+
+// ============================================================================
+// CANDIDATE PARSING
+// ============================================================================
+
+process PARSE_SIFTED_CANDIDATES {
+    tag "combine_fold_params"
+    label 'presto'
+    container "${params.presto_container}"
+
+    input:
+    path fold_param_files
+
+    output:
+    path "fold_params.txt", emit: fold_params
 
     script:
     """
-    #!/bin/bash
-    # Sift candidates by sigma threshold
-    # Extract candidates with sigma >= threshold (sigma is 2nd column)
+    # Combine all fold_params files from different (zmax, wmax) combinations
+    cat fold_params_z*.txt > fold_params.txt
 
-    # Process all ACCEL candidate files
-    for cand_file in *_ACCEL_*.cand; do
-        if [ -f "\$cand_file" ]; then
-            grep -v "^#" "\$cand_file" | awk -v thresh=${sigma_threshold} '\$2 >= thresh {print}' >> sifted.cands
-        fi
-    done
-
-    # If no candidates found, create empty file
-    if [ ! -f sifted.cands ]; then
-        touch sifted.cands
-    fi
-
-    # Create sift summary
-    num_cands=\$(wc -l < sifted.cands 2>/dev/null || echo 0)
-    echo "Sifted candidates with sigma >= ${sigma_threshold}" > sifted.sift
-    echo "Total candidates: \$num_cands" >> sifted.sift
+    echo "Combined fold parameters from \$(ls fold_params_z*.txt | wc -l) files"
+    echo "Total candidates to fold: \$(wc -l < fold_params.txt)"
     """
 }
 
@@ -252,12 +354,26 @@ process PREPFOLD {
     label 'presto'
     label 'process_high'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/05_FOLDING", mode: 'copy'
+    publishDir {
+        def obs_name = observation.baseName
+        // Extract segment label from accelfile name (e.g., _half_1 or _full)
+        def segment_label = 'full'
+        if (accelfile.name.contains('_half_')) {
+            def chunk = accelfile.name.split('_half_')[1].split('_')[0]
+            segment_label = "half_${chunk}"
+        } else if (accelfile.name.contains('_quarter_')) {
+            def chunk = accelfile.name.split('_quarter_')[1].split('_')[0]
+            segment_label = "quarter_${chunk}"
+        } else if (accelfile.name.contains('_third_')) {
+            def chunk = accelfile.name.split('_third_')[1].split('_')[0]
+            segment_label = "third_${chunk}"
+        }
+        "${params.outdir}/${obs_name}/05_FOLDING/${segment_label}"
+    }, mode: 'copy'
 
     input:
-    tuple path(observation), path(mask), val(cand_num), val(dm), val(period), val(accel)
+    tuple path(observation), path(rfi_products), path(accelfile), path(candfile), path(inffile), val(cand_num), val(dm)
     val npart
-    val dmstep
     val extra_flags
 
     output:
@@ -265,8 +381,10 @@ process PREPFOLD {
 
     script:
     basename = observation.baseName
+    // Find the mask file from rfi_products
+    mask_file = rfi_products.find { it.name.endsWith('.mask') }
     """
-    prepfold -noxwin -accelcand ${cand_num} -dm ${dm} -dmstep ${dmstep} -npart ${npart} -mask ${mask} ${extra_flags} -o ${basename}_cand${cand_num} ${observation}
+    prepfold -noxwin -accelcand ${cand_num} -accelfile ${candfile} -dm ${dm} -npart ${npart} -mask ${mask_file} ${extra_flags} -o ${basename}_cand${cand_num} ${observation}
     """
 }
 
@@ -275,7 +393,7 @@ process PREPFOLD_TIMESERIES {
     label 'presto'
     label 'process_high'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/05_FOLDING", mode: 'copy'
+    publishDir "${params.outdir}/${datfile.name.split('_DM')[0]}/05_FOLDING", mode: 'copy'
 
     input:
     tuple val(dm), path(datfile), path(inffile), val(cand_num), val(period), val(accel)
@@ -301,7 +419,7 @@ process SINGLE_PULSE_SEARCH {
     label 'presto'
     label 'process_medium'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/06_SINGLE_PULSES", mode: 'copy'
+    publishDir "${params.outdir}/${datfile.name.split('_DM')[0]}/06_SINGLE_PULSES", mode: 'copy'
 
     input:
     tuple val(dm), path(datfile), path(inffile)
@@ -324,7 +442,12 @@ process MAKE_ZAPLIST {
     tag "create_zaplist"
     label 'presto'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/02_BIRDIES", mode: 'copy'
+
+    // Extract observation basename from first cand file
+    publishDir {
+        def first_file = accel_cand_files instanceof List ? accel_cand_files[0] : accel_cand_files
+        "${params.outdir}/${first_file.name.split('_DM')[0]}/02_BIRDIES"
+    }, mode: 'copy'
 
     input:
     path accel_cand_files
@@ -368,7 +491,12 @@ process COMBINE_CANDIDATES {
     tag "combine_all_dms"
     label 'presto'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/04_SIFTING", mode: 'copy'
+
+    // Extract observation basename from first cand file
+    publishDir {
+        def first_file = all_cand_files instanceof List ? all_cand_files[0] : all_cand_files
+        "${params.outdir}/${first_file.name.split('_DM')[0]}/04_SIFTING"
+    }, mode: 'copy'
 
     input:
     path all_cand_files

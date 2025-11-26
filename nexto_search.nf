@@ -16,6 +16,7 @@ include {
     RFIFIND;
     PREPDATA as PREPDATA_ZERODM;
     PREPDATA as PREPDATA_DMTRIALS;
+    SPLIT_DATFILE;
     REALFFT as REALFFT_ZERODM;
     REALFFT as REALFFT_DMTRIALS;
     REDNOISE as REDNOISE_ZERODM;
@@ -24,11 +25,11 @@ include {
     ACCELSEARCH_ZMAX0;
     ACCELSEARCH;
     ACCELSIFT;
+    PARSE_SIFTED_CANDIDATES;
     PREPFOLD;
     PREPFOLD_TIMESERIES;
     SINGLE_PULSE_SEARCH;
-    MAKE_ZAPLIST;
-    COMBINE_CANDIDATES
+    MAKE_ZAPLIST
 } from './modules.nf'
 
 /*
@@ -182,8 +183,49 @@ workflow {
     // Run prepdata for all DM trials without -nobary
     PREPDATA_DMTRIALS(dm_trials_input)
 
-    // Step 7: FFT processing for DM trials
-    REALFFT_DMTRIALS(PREPDATA_DMTRIALS.out.timeseries)
+    // Step 6b: Split timeseries into segments
+    // Create segment channel: for each [name, fraction], calculate number of chunks
+    segments_ch = Channel.from(params.segments)
+        .map { name_fraction ->
+            def segment_name = name_fraction[0]
+            def fraction = name_fraction[1]
+            def total_chunks = fraction == 1.0 ? 1 : Math.ceil(1.0 / fraction) as int
+            [segment_name, fraction, total_chunks]
+        }
+        .flatMap { segment_name, fraction, total_chunks ->
+            (1..total_chunks).collect { chunk_num -> [segment_name, fraction, chunk_num, total_chunks] }
+        }
+
+    // Split timeseries into full vs. segments to split
+    timeseries_with_segments = PREPDATA_DMTRIALS.out.timeseries
+        .combine(segments_ch)
+
+    // For fraction=1.0, pass through without splitting
+    full_timeseries = timeseries_with_segments
+        .filter { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks -> fraction == 1.0 }
+        .map { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks ->
+            [dm, segment_name, chunk_num, datfile, inffile]
+        }
+
+    // For fraction<1.0, run SPLIT_DATFILE
+    split_input = timeseries_with_segments
+        .filter { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks -> fraction < 1.0 }
+        .map { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks ->
+            [dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks]
+        }
+
+    SPLIT_DATFILE(split_input)
+
+    // Combine full and split segments
+    all_segments = full_timeseries.mix(SPLIT_DATFILE.out.segments)
+
+    // Step 7: FFT processing for DM trials (now on segments)
+    REALFFT_DMTRIALS(
+        all_segments
+            .map { dm, segment_name, chunk_num, datfile, inffile ->
+                [dm, datfile, inffile]
+            }
+    )
     REDNOISE_DMTRIALS(REALFFT_DMTRIALS.out.fft_products)
 
     // Step 8: Apply birdie mask to all DM trial FFTs
@@ -212,41 +254,57 @@ workflow {
 
     candidates_ch = ACCELSEARCH.out.candidates
 
-    candidates_ch.view()
-
     // Step 11: Sift candidates
-    // Group by DM and collect all accel/cand files
+    // Group by zmax and wmax (indices 1 and 2), collect all ACCEL files across all DMs
     ACCELSIFT(
         candidates_ch
-            .groupTuple(by: 0)
-            .map { dm, zmax_list, wmax_list, accel_list, cand_list ->
-                [dm, accel_list.flatten(), cand_list.flatten()]
-            },
-        params.sigma_threshold
+            .map { dm, zmax, wmax, accel, cand, inffile -> [zmax, wmax, accel] }
+            .groupTuple(by: [0, 1]),
+        params.sigma_threshold,
+        params.period_to_search_min,
+        params.period_to_search_max,
+        params.flag_remove_duplicates ? 1 : 0,
+        params.flag_remove_harmonics ? 1 : 0
     )
 
-    // Step 12: Combine all candidates
-    COMBINE_CANDIDATES(
-        candidates_ch
-            .map { dm, zmax, wmax, accel, cand -> cand }
-            .collect()
+    // Step 12: Combine fold parameters from all (zmax, wmax) combinations
+    PARSE_SIFTED_CANDIDATES(
+        ACCELSIFT.out.fold_params.collect()
     )
 
     // Step 13: Fold top candidates
-    // Parse top candidates and fold them
-    top_candidates = ACCELSIFT.out.sifted_candidates
-        .flatMap { dm, sift, cands ->
-            // Parse candidate file and extract top candidates
-            // This is simplified - in practice you'd parse the .cands file
-            // For now, we'll create a simple channel structure
-            []
+    // Parse the fold_params.txt file and create fold inputs
+    top_candidates = PARSE_SIFTED_CANDIDATES.out.fold_params
+        .splitCsv(sep: '\t')
+        .map { accelfile_name, candnum, dm ->
+            [accelfile_name, candnum as Integer, dm as Double]
         }
 
-    // Combine with original observation for folding
-    fold_input = RFIFIND.out.rfi_products
-        .combine(top_candidates)
+    // Create a channel of [accelfile_name, accelfile_path, candfile_path, inffile_path] from ACCELSEARCH output
+    accel_file_map = candidates_ch
+        .map { dm, zmax, wmax, accel, cand, inffile ->
+            [accel.name, accel, cand, inffile]
+        }
+        .unique()
 
-    // PREPFOLD(fold_input, params.npart, params.dmstep)
+    // Combine top candidates with their actual ACCEL, CAND, and INF file paths
+    candidates_with_files = top_candidates
+        .combine(accel_file_map)
+        .filter { accelfile_name, candnum, dm, accel_name, accel_path, cand_path, inffile_path ->
+            accelfile_name == accel_name
+        }
+        .map { accelfile_name, candnum, dm, accel_name, accel_path, cand_path, inffile_path ->
+            [accel_path, cand_path, inffile_path, candnum, dm]
+        }
+
+    // Combine with original observation and all RFI products for folding
+    fold_input = RFIFIND.out.rfi_products
+        .combine(candidates_with_files)
+        .map { obs, rfi_products, accelfile, candfile, inffile, candnum, dm ->
+            [obs, rfi_products, accelfile, candfile, inffile, candnum, dm]
+        }
+
+    PREPFOLD(fold_input, params.npart, params.prepfold_extra_flags)
 
     // Step 14: Optional single pulse search (on DM trials without nobary)
     if (params.enable_single_pulse) {
