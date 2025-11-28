@@ -16,12 +16,6 @@ include {
     RFIFIND;
     PREPDATA as PREPDATA_ZERODM;
     PREPDATA as PREPDATA_DMTRIALS;
-    SPLIT_DATFILE;
-    REALFFT as REALFFT_ZERODM;
-    REALFFT as REALFFT_DMTRIALS;
-    REDNOISE as REDNOISE_ZERODM;
-    REDNOISE as REDNOISE_DMTRIALS;
-    ZAPBIRDS;
     ACCELSEARCH_ZMAX0;
     ACCELSEARCH;
     ACCELSIFT;
@@ -44,6 +38,7 @@ params.downsample = 1
 params.search_params = [[0,0], [50,0], [200,0]]  // List of [zmax, wmax] tuples
 params.numharm = 8
 params.sigma_threshold = 6.0
+params.sigma_birdies_threshold = 15.0
 params.rfifind_time = 2.0
 params.rfifind_freqsig = 4.0
 params.rfifind_extra_flags = ""
@@ -98,6 +93,7 @@ def helpMessage() {
 
     Candidate selection:
         --sigma_threshold      Minimum sigma for candidates (default: 6.0)
+        --sigma_birdies_threshold  Minimum sigma for birdie detection (default: 4.0)
         --npart                Number of phase bins for folding (default: 50)
         --dmstep               DM step for prepfold (default: 1)
         --prepfold_extra_flags Additional flags for prepfold (default: "")
@@ -138,7 +134,6 @@ workflow {
     )
 
     // Step 2: Zero-DM prepdata with -nobary for birdie detection
-    // Create zero-DM input channel
     zero_dm_input = RFIFIND.out.rfi_products
         .map { obs, rfi_products ->
             [obs, rfi_products, 0.0, params.downsample, true, params.prepdata_extra_flags]
@@ -147,25 +142,25 @@ workflow {
     // Run prepdata with DM=0 and nobary=true
     PREPDATA_ZERODM(zero_dm_input)
 
-    // Step 3: FFT processing for zero-DM
-    REALFFT_ZERODM(PREPDATA_ZERODM.out.timeseries)
-    REDNOISE_ZERODM(REALFFT_ZERODM.out.fft_products)
-
-    // Step 4: Identify birdies (RFI lines) using z=0 search on zero-DM
+    // Step 3: Identify birdies (RFI lines) using z=0 search on zero-DM
+    // ACCELSEARCH_ZMAX0 will do FFT, rednoise, and accelsearch internally
     ACCELSEARCH_ZMAX0(
-        REDNOISE_ZERODM.out.rednoise_fft,
+        PREPDATA_ZERODM.out.timeseries,
         params.numharm
     )
 
-    // Step 5: Create zaplist from birdies
+    // Step 4: Create zaplist from birdies (use ACCEL_0 files)
     MAKE_ZAPLIST(
         ACCELSEARCH_ZMAX0.out.accel_zero
-            .map { dm, accel, cand -> cand }
+            .map { accel, cand, txtcand -> accel }
             .collect(),
-        1.0
+        PREPDATA_ZERODM.out.timeseries
+            .map { dm, datfile, inffile -> inffile }
+            .first(),
+        params.sigma_birdies_threshold
     )
 
-    // Step 6: Now do the actual DM trials WITHOUT -nobary
+    // Step 5: Now do the actual DM trials WITHOUT -nobary
     // Generate DM values as a list
     def dm_start = params.dm_low
     def dm_end = params.dm_high
@@ -183,8 +178,7 @@ workflow {
     // Run prepdata for all DM trials without -nobary
     PREPDATA_DMTRIALS(dm_trials_input)
 
-    // Step 6b: Split timeseries into segments
-    // Create segment channel: for each [name, fraction], calculate number of chunks
+    // Step 6: Create segment channel and combine with timeseries
     segments_ch = Channel.from(params.segments)
         .map { name_fraction ->
             def segment_name = name_fraction[0]
@@ -196,56 +190,29 @@ workflow {
             (1..total_chunks).collect { chunk_num -> [segment_name, fraction, chunk_num, total_chunks] }
         }
 
-    // Split timeseries into full vs. segments to split
-    timeseries_with_segments = PREPDATA_DMTRIALS.out.timeseries
+    // Combine timeseries with segments and zaplist for acceleration search
+    accel_input = PREPDATA_DMTRIALS.out.timeseries
         .combine(segments_ch)
-
-    // For fraction=1.0, pass through without splitting
-    full_timeseries = timeseries_with_segments
-        .filter { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks -> fraction == 1.0 }
-        .map { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks ->
-            [dm, segment_name, chunk_num, datfile, inffile]
+        .combine(MAKE_ZAPLIST.out.zaplist)
+        .map { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zaplist ->
+            [dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zaplist]
         }
 
-    // For fraction<1.0, run SPLIT_DATFILE
-    split_input = timeseries_with_segments
-        .filter { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks -> fraction < 1.0 }
-        .map { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks ->
-            [dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks]
-        }
-
-    SPLIT_DATFILE(split_input)
-
-    // Combine full and split segments
-    all_segments = full_timeseries.mix(SPLIT_DATFILE.out.segments)
-
-    // Step 7: FFT processing for DM trials (now on segments)
-    REALFFT_DMTRIALS(
-        all_segments
-            .map { dm, segment_name, chunk_num, datfile, inffile ->
-                [dm, datfile, inffile]
-            }
-    )
-    REDNOISE_DMTRIALS(REALFFT_DMTRIALS.out.fft_products)
-
-    // Step 8: Apply birdie mask to all DM trial FFTs
-    ZAPBIRDS(
-        REDNOISE_DMTRIALS.out.rednoise_fft,
-        MAKE_ZAPLIST.out.zaplist
-    )
-
-    // Step 9: Acceleration/Jerk search on zapped FFTs
+    // Step 7: Acceleration/Jerk search (includes split, FFT, rednoise, zapbirds, accelsearch)
     // Create channel of search tuples from params
     search_tuples_ch = Channel.from(params.search_params)
 
-    // Combine each zapped FFT with all search tuples
-    search_input = ZAPBIRDS.out.zapped_fft
-        .combine(search_tuples_ch)
+    // Combine each timeseries with all search tuples
+    search_input = accel_input.combine(search_tuples_ch)
 
     // Run ACCELSEARCH for each (zmax, wmax) tuple
     ACCELSEARCH(
-        search_input.map { dm, fft, inf, zmax, wmax -> [dm, fft, inf] },
-        search_input.map { dm, fft, inf, zmax, wmax -> [zmax, wmax] },
+        search_input.map { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zaplist, zmax, wmax ->
+            [dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zaplist]
+        },
+        search_input.map { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zaplist, zmax, wmax ->
+            [zmax, wmax]
+        },
         params.numharm,
         params.use_cuda,
         params.gpu_id,
@@ -258,7 +225,7 @@ workflow {
     // Group by zmax and wmax (indices 1 and 2), collect all ACCEL files across all DMs
     ACCELSIFT(
         candidates_ch
-            .map { dm, zmax, wmax, accel, cand, inffile -> [zmax, wmax, accel] }
+            .map { dm, zmax, wmax, accel, cand, txtcand, inffile -> [zmax, wmax, accel] }
             .groupTuple(by: [0, 1]),
         params.sigma_threshold,
         params.period_to_search_min,
@@ -280,28 +247,61 @@ workflow {
             [accelfile_name, candnum as Integer, dm as Double]
         }
 
-    // Create a channel of [accelfile_name, accelfile_path, candfile_path, inffile_path] from ACCELSEARCH output
+    // Create a channel of [accelfile_name, accelfile_path, candfile_path, accel_inffile_path] from ACCELSEARCH output
     accel_file_map = candidates_ch
-        .map { dm, zmax, wmax, accel, cand, inffile ->
+        .map { dm, zmax, wmax, accel, cand, txtcand, inffile ->
             [accel.name, accel, cand, inffile]
         }
+        .unique()
+
+    // Create a combined timeseries map from both full DM trials and segments
+    // Full DM trials from PREPDATA
+    full_timeseries_map = PREPDATA_DMTRIALS.out.timeseries
+        .map { dm, datfile, inffile ->
+            [datfile.baseName, dm, datfile, inffile]
+        }
+
+    // Segment timeseries from ACCELSEARCH (optional, only for segmented searches)
+    // Note: Each segment is created multiple times (once per zmax), so we need to deduplicate
+    segment_timeseries_map = ACCELSEARCH.out.segment_timeseries
+        .map { dm, segment_name, chunk_num, datfile, inffile ->
+            [datfile.baseName, dm, datfile, inffile]
+        }
+        .unique { it[0..1] }  // Unique by [basename, dm] to avoid duplicates
+
+    // Combine both full and segment timeseries
+    all_timeseries_map = full_timeseries_map.mix(segment_timeseries_map)
         .unique()
 
     // Combine top candidates with their actual ACCEL, CAND, and INF file paths
     candidates_with_files = top_candidates
         .combine(accel_file_map)
-        .filter { accelfile_name, candnum, dm, accel_name, accel_path, cand_path, inffile_path ->
+        .filter { accelfile_name, candnum, dm, accel_name, accel_path, cand_path, accel_inffile_path ->
             accelfile_name == accel_name
         }
-        .map { accelfile_name, candnum, dm, accel_name, accel_path, cand_path, inffile_path ->
-            [accel_path, cand_path, inffile_path, candnum, dm]
+        .map { accelfile_name, candnum, dm, accel_name, accel_path, cand_path, accel_inffile_path ->
+            // Extract the expected timeseries basename from accel filename
+            // E.g., J1818-1422_DM619.00_half_1_ACCEL_50 -> J1818-1422_DM619.00_half_1
+            def ts_basename = accel_name.replaceAll(/_ACCEL_\d+$/, '')
+            [accel_path, cand_path, accel_inffile_path, candnum, dm, ts_basename]
+        }
+
+    // Combine with timeseries files based on basename match
+    candidates_with_timeseries = candidates_with_files
+        .combine(all_timeseries_map)
+        .filter { accel_path, cand_path, accel_inffile_path, candnum, dm_from_cand, ts_basename_expected, ts_basename_actual, dm_from_ts, datfile, ts_inffile ->
+            // Match both basename and DM
+            ts_basename_expected == ts_basename_actual && Math.abs(dm_from_cand - dm_from_ts) < 0.01
+        }
+        .map { accel_path, cand_path, accel_inffile_path, candnum, dm_from_cand, ts_basename_expected, ts_basename_actual, dm_from_ts, datfile, ts_inffile ->
+            [accel_path, cand_path, accel_inffile_path, datfile, ts_inffile, candnum, dm_from_cand]
         }
 
     // Combine with original observation and all RFI products for folding
     fold_input = RFIFIND.out.rfi_products
-        .combine(candidates_with_files)
-        .map { obs, rfi_products, accelfile, candfile, inffile, candnum, dm ->
-            [obs, rfi_products, accelfile, candfile, inffile, candnum, dm]
+        .combine(candidates_with_timeseries)
+        .map { obs, rfi_products, accelfile, candfile, accel_inffile, datfile, ts_inffile, candnum, dm ->
+            [obs, rfi_products, accelfile, candfile, accel_inffile, datfile, ts_inffile, candnum, dm]
         }
 
     PREPFOLD(fold_input, params.npart, params.prepfold_extra_flags)
