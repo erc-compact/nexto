@@ -13,6 +13,7 @@ nextflow.enable.dsl=2
 // Import modules
 include {
     READFILE;
+    FILTOOL;
     RFIFIND;
     PREPDATA as PREPDATA_ZERODM;
     PREPDATA as PREPDATA_DMTRIALS;
@@ -125,9 +126,24 @@ workflow {
     // Create input channel
     observation_ch = Channel.fromPath(params.input, checkIfExists: true)
 
+    // Step 0: Optional filtool preprocessing
+    if (params.enable_filtool) {
+        FILTOOL(
+            observation_ch,
+            params.filtool_time_decimate,
+            params.filtool_freq_decimate,
+            params.filtool_telescope,
+            params.filtool_rfi_filter,
+            params.filtool_extra_args
+        )
+        processed_obs = FILTOOL.out.filtered_observation
+    } else {
+        processed_obs = observation_ch
+    }
+
     // Step 1: RFI detection
     RFIFIND(
-        observation_ch,
+        processed_obs,
         params.rfifind_time,
         params.rfifind_freqsig,
         params.rfifind_extra_flags

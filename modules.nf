@@ -23,6 +23,47 @@ process READFILE {
 }
 
 // ============================================================================
+// FILTERBANK PREPROCESSING
+// ============================================================================
+process FILTOOL {
+    tag "$observation"
+    label 'presto'
+    label 'process_medium'
+    container "${params.pulsarx_container}"
+    publishDir "${params.outdir}/${observation.baseName}/00_FILTOOL", mode: 'copy'
+    maxForks 1
+
+    input:
+    path observation
+    val time_decimate
+    val freq_decimate
+    val telescope
+    val rfi_filter
+    val extra_args
+
+    output:
+    path "${basename}_filtool_01.fil", emit: filtered_observation
+
+    script:
+    basename = observation.baseName
+    publishDir = "${params.outdir}/${basename}/00_FILTOOL"
+    outfile = "${basename}_filtool"
+    """
+    # Create publish directory and write directly to it (file is too large for work directory)
+    mkdir -p ${publishDir}
+
+    # Run filtool with all parameters
+    filtool -t ${task.cpus} --td ${time_decimate} --fd ${freq_decimate} \
+        --telescope ${telescope} -z ${rfi_filter} \
+        -o ${publishDir}/${outfile} ${extra_args} \
+        -f ${observation}
+
+    # Create symlink in work directory for Nextflow output handling
+    ln -s ${publishDir}/${outfile}_01.fil ${outfile}_01.fil
+    """
+}
+
+// ============================================================================
 // RFI DETECTION & MITIGATION
 // ============================================================================
 
@@ -178,7 +219,7 @@ process ACCELSEARCH {
         fi
 
         # Step 4: Acceleration search
-        accelsearch -zmax ${zmax} ${wmax_flag} -numharm ${numharm} ${cuda_flag} ${extra_flags} ${outname}.fft
+        accelsearch -zmax ${zmax} -wmax ${wmax} -numharm ${numharm} ${cuda_flag} ${extra_flags} ${outname}.fft
 
         # Keep inf file for output (ACCEL file is named ${outname}_ACCEL_${zmax})
         cp ${outname}.inf ${outname}_ACCEL_${zmax}.inf
@@ -231,7 +272,7 @@ process ACCELSEARCH {
         fi
 
         # Step 5: Acceleration search
-        accelsearch -zmax ${zmax} ${wmax_flag} -numharm ${numharm} ${cuda_flag} ${extra_flags} ${outname}.fft
+        accelsearch -zmax ${zmax} -wmax ${wmax} -numharm ${numharm} ${cuda_flag} ${extra_flags} ${outname}.fft
 
         # Keep inf file for output (ACCEL file is named ${outname}_ACCEL_${zmax})
         cp ${outname}.inf ${outname}_ACCEL_${zmax}.inf
