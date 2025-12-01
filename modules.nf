@@ -72,16 +72,17 @@ process RFIFIND {
     label 'presto'
     label 'process_medium'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/${observation.baseName}/01_RFIFIND", mode: 'copy'
+    publishDir "${params.outdir}/${original_basename}/01_RFIFIND", mode: 'copy'
 
     input:
     path observation
+    val original_basename
     val time_interval
     val freq_interval
     val extra_flags
 
     output:
-    tuple path(observation), path("${basename}_rfifind.*"), emit: rfi_products
+    tuple path(observation), path("${basename}_rfifind.*"), val(original_basename), emit: rfi_products
     path "${basename}_rfifind.mask", emit: mask
     path "*.ps", emit: plots optional true
 
@@ -101,7 +102,7 @@ process PREPDATA {
     label 'presto'
     label 'process_high'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/${observation.baseName}/02_TIMESERIES", mode: 'copy', enabled: params.publish_timeseries
+    publishDir "${params.outdir}/${observation.baseName.split('_filtool')[0]}/02_TIMESERIES", mode: 'copy', enabled: params.publish_timeseries
     maxForks 2
 
     input:
@@ -129,7 +130,7 @@ process ACCELSEARCH_ZMAX0 {
     label 'presto'
     label 'process_low'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/${datfile.name.split('_DM')[0]}/02_BIRDIES", mode: 'copy', pattern: "*_ACCEL_0*"
+    publishDir "${params.outdir}/${datfile.name.split('_DM')[0].split('_filtool')[0]}/02_BIRDIES", mode: 'copy', pattern: "*_ACCEL_0*"
     scratch true  // Use scratch space for intermediate files
 
     input:
@@ -169,7 +170,7 @@ process ACCELSEARCH {
     label 'process_high'
     container "${params.presto_container}"
     publishDir {
-        def obs_name = datfile.name.split('_DM')[0]
+        def obs_name = datfile.name.split('_DM')[0].split('_filtool')[0]
         "${params.outdir}/${obs_name}/03_DEDISPERSION/${segment_name}"
     }, mode: 'copy', pattern: "*_ACCEL_*"
     scratch true  // Use scratch space for intermediate files
@@ -183,19 +184,25 @@ process ACCELSEARCH {
     val extra_flags
 
     output:
-    tuple val(dm), val(zmax), val(wmax), path("*_ACCEL_${zmax}"), path("*_ACCEL_${zmax}.cand"), path("*_ACCEL_${zmax}.txtcand"), path("*_ACCEL_${zmax}.inf"), emit: candidates
-    tuple val(dm), val(segment_name), val(chunk_num), path("${basename}_${segment_name}_${chunk_num}.dat"), path("${basename}_${segment_name}_${chunk_num}.inf"), emit: segment_timeseries optional true
+    tuple val(dm), val(segment_name), val(chunk_num), val(zmax), val(wmax), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.cand"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.txtcand"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.inf"), emit: candidates
+    tuple val(dm), val(segment_name), val(chunk_num), path("*_${segment_name}_${chunk_num}.dat"), path("*_${segment_name}_${chunk_num}.inf"), emit: segment_timeseries, optional: true
 
     script:
     basename = datfile.baseName
-    cuda_flag = use_cuda ? "-cuda ${gpu_id}" : ""
-    wmax_flag = wmax > 0 ? "-wmax ${wmax}" : ""
+    accelsearch_binary = use_cuda ? "accelsearch_cu" : "accelsearch"
+    wmax_flag = wmax > 0 ? "-wmax ${wmax}" : "-wmax 0"
+    // Construct proper output suffix for jerk searches
+    jerk_suffix = wmax > 0 ? "_JERK_${wmax}" : ""    
+
 
     if (fraction == 1.0) {
         // Full observation - no splitting
         outname = "${basename}"
         """
         #!/bin/bash
+
+
+
         # Step 1: FFT (realfft creates .fft from .dat, .inf stays the same)
         realfft ${datfile}
 
@@ -219,10 +226,10 @@ process ACCELSEARCH {
         fi
 
         # Step 4: Acceleration search
-        accelsearch -zmax ${zmax} -wmax ${wmax} -numharm ${numharm} ${cuda_flag} ${extra_flags} ${outname}.fft
+        ${accelsearch_binary} -zmax ${zmax} ${wmax_flag} -numharm ${numharm} ${extra_flags} ${outname}.fft
 
-        # Keep inf file for output (ACCEL file is named ${outname}_ACCEL_${zmax})
-        cp ${outname}.inf ${outname}_ACCEL_${zmax}.inf
+        # Keep inf file for output (ACCEL file is named ${outname}_ACCEL_${zmax}${jerk_suffix})
+        cp ${outname}.inf ${outname}_ACCEL_${zmax}${jerk_suffix}.inf
 
         # Clean up FFT and original inf files (keep only ACCEL results and matching inf)
         rm -f ${outname}.fft ${outname}.inf
@@ -272,10 +279,10 @@ process ACCELSEARCH {
         fi
 
         # Step 5: Acceleration search
-        accelsearch -zmax ${zmax} -wmax ${wmax} -numharm ${numharm} ${cuda_flag} ${extra_flags} ${outname}.fft
+        ${accelsearch_binary} -zmax ${zmax} ${wmax_flag} -numharm ${numharm} ${extra_flags} ${outname}.fft
 
-        # Keep inf file for output (ACCEL file is named ${outname}_ACCEL_${zmax})
-        cp ${outname}.inf ${outname}_ACCEL_${zmax}.inf
+        # Keep inf file for output (ACCEL file is named ${outname}_ACCEL_${zmax}${jerk_suffix})
+        cp ${outname}.inf ${outname}_ACCEL_${zmax}${jerk_suffix}.inf
 
         # Keep segment timeseries files for prepfold (dat and inf with segment name)
         # These were created by prepdata -start in Step 1
@@ -293,31 +300,13 @@ process ACCELSEARCH {
 // ============================================================================
 
 process ACCELSIFT {
-    tag "sift_z${zmax}_w${wmax}"
+    //tag "sift_z${zmax}_w${wmax}_${segment_label}"
     label 'presto'
     container "${params.presto_container}"
-
-    // Extract observation basename and segment from first accel file
-    publishDir {
-        def first_file = accel_files instanceof List ? accel_files[0] : accel_files
-        def obs_name = first_file.name.split('_DM')[0]
-        // Extract segment label from filename (e.g., _half_1 or _full)
-        def segment_label = 'full'
-        if (first_file.name.contains('_half_')) {
-            def chunk = first_file.name.split('_half_')[1].split('_')[0]
-            segment_label = "half_${chunk}"
-        } else if (first_file.name.contains('_quarter_')) {
-            def chunk = first_file.name.split('_quarter_')[1].split('_')[0]
-            segment_label = "quarter_${chunk}"
-        } else if (first_file.name.contains('_third_')) {
-            def chunk = first_file.name.split('_third_')[1].split('_')[0]
-            segment_label = "third_${chunk}"
-        }
-        "${params.outdir}/${obs_name}/04_SIFTING/${segment_label}"
-    }, mode: 'copy', pattern: "*.txt"
+    publishDir { "${params.outdir}/${obs_basename}/04_SIFTING" }, mode: 'copy', pattern: "*.txt"
 
     input:
-    tuple val(zmax), val(wmax), path(accel_files)
+    tuple val(zmax), val(wmax), path(accel_files), val(segment_label), val(obs_basename)
     val sigma_threshold
     val period_min
     val period_max
@@ -325,8 +314,8 @@ process ACCELSIFT {
     val flag_remove_harmonics
 
     output:
-    path "best_candidates_z${zmax}_w${wmax}.txt", emit: sifted_candidates
-    path "fold_params_z${zmax}_w${wmax}.txt", emit: fold_params
+    path "best_candidates_${segment_label}_z${zmax}_w${wmax}.txt", emit: sifted_candidates
+    path "fold_params_${segment_label}_z${zmax}_w${wmax}.txt", emit: fold_params
 
     script:
     wmax_suffix = wmax > 0 ? "_JERK_${wmax}" : ""
@@ -337,8 +326,8 @@ process ACCELSIFT {
     accel_list=(*_ACCEL_${zmax}${wmax_suffix})
 
     if [ \${#accel_list[@]} -eq 0 ]; then
-        echo "No candidates found" > best_candidates_z${zmax}_w${wmax}.txt
-        touch fold_params_z${zmax}_w${wmax}.txt
+        echo "No candidates found" > best_candidates_${segment_label}_z${zmax}_w${wmax}.txt
+        touch fold_params_${segment_label}_z${zmax}_w${wmax}.txt
         exit 0
     fi
 
@@ -351,8 +340,8 @@ process ACCELSIFT {
         ${dup_flag} \
         ${harm_flag} \
         --max-cands-to-fold ${params.max_cands_to_fold} \
-        --output best_candidates_z${zmax}_w${wmax}.txt \
-        --fold-params fold_params_z${zmax}_w${wmax}.txt
+        --output best_candidates_${segment_label}_z${zmax}_w${wmax}.txt \
+        --fold-params fold_params_${segment_label}_z${zmax}_w${wmax}.txt
     """
 }
 
@@ -373,10 +362,10 @@ process PARSE_SIFTED_CANDIDATES {
 
     script:
     """
-    # Combine all fold_params files from different (zmax, wmax) combinations
-    cat fold_params_z*.txt > fold_params.txt
+    # Combine all fold_params files from different segments and (zmax, wmax) combinations
+    cat fold_params_*.txt > fold_params.txt 2>/dev/null || touch fold_params.txt
 
-    echo "Combined fold parameters from \$(ls fold_params_z*.txt | wc -l) files"
+    echo "Combined fold parameters from \$(ls fold_params_*.txt 2>/dev/null | wc -l) files"
     echo "Total candidates to fold: \$(wc -l < fold_params.txt)"
     """
 }
@@ -391,7 +380,7 @@ process PREPFOLD {
     label 'process_high'
     container "${params.presto_container}"
     publishDir {
-        def obs_name = observation.baseName
+        def obs_name = observation.baseName.split('_filtool')[0]
         // Extract segment label from accelfile name (e.g., _half_1 or _full)
         def segment_label = 'full'
         if (accelfile.name.contains('_half_')) {
@@ -432,7 +421,7 @@ process PREPFOLD_TIMESERIES {
     label 'presto'
     label 'process_high'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/${datfile.name.split('_DM')[0]}/05_FOLDING", mode: 'copy'
+    publishDir "${params.outdir}/${datfile.name.split('_DM')[0].split('_filtool')[0]}/05_FOLDING", mode: 'copy'
 
     input:
     tuple val(dm), path(datfile), path(inffile), val(cand_num), val(period), val(accel)
@@ -458,7 +447,7 @@ process SINGLE_PULSE_SEARCH {
     label 'presto'
     label 'process_medium'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/${datfile.name.split('_DM')[0]}/06_SINGLE_PULSES", mode: 'copy'
+    publishDir "${params.outdir}/${datfile.name.split('_DM')[0].split('_filtool')[0]}/06_SINGLE_PULSES", mode: 'copy'
 
     input:
     tuple val(dm), path(datfile), path(inffile)
@@ -484,7 +473,7 @@ process MAKE_ZAPLIST {
 
     publishDir {
         def first_file = accel_files instanceof List ? accel_files[0] : accel_files
-        "${params.outdir}/${first_file.name.split('_DM')[0]}/02_BIRDIES"
+        "${params.outdir}/${first_file.name.split('_DM')[0].split('_filtool')[0]}/02_BIRDIES"
     }, mode: 'copy'
 
     input:

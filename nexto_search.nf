@@ -126,6 +126,9 @@ workflow {
     // Create input channel
     observation_ch = Channel.fromPath(params.input, checkIfExists: true)
 
+    // Capture original observation basename before any processing
+    original_basename_ch = observation_ch.map { obs -> obs.baseName }.first()
+
     // Step 0: Optional filtool preprocessing
     if (params.enable_filtool) {
         FILTOOL(
@@ -144,6 +147,7 @@ workflow {
     // Step 1: RFI detection
     RFIFIND(
         processed_obs,
+        original_basename_ch,
         params.rfifind_time,
         params.rfifind_freqsig,
         params.rfifind_extra_flags
@@ -151,7 +155,7 @@ workflow {
 
     // Step 2: Zero-DM prepdata with -nobary for birdie detection
     zero_dm_input = RFIFIND.out.rfi_products
-        .map { obs, rfi_products ->
+        .map { obs, rfi_products, original_basename ->
             [obs, rfi_products, 0.0, params.downsample, true, params.prepdata_extra_flags]
         }
 
@@ -189,7 +193,7 @@ workflow {
     // Combine observation with RFI products and DM values, with nobary=false
     dm_trials_input = RFIFIND.out.rfi_products
         .combine(Channel.from(dm_values))
-        .map { obs, rfi_products, dm -> [obs, rfi_products, dm, params.downsample, false, params.prepdata_extra_flags] }
+        .map { obs, rfi_products, original_basename, dm -> [obs, rfi_products, dm, params.downsample, false, params.prepdata_extra_flags] }
 
     // Run prepdata for all DM trials without -nobary
     PREPDATA_DMTRIALS(dm_trials_input)
@@ -238,11 +242,22 @@ workflow {
     candidates_ch = ACCELSEARCH.out.candidates
 
     // Step 11: Sift candidates
-    // Group by zmax and wmax (indices 1 and 2), collect all ACCEL files across all DMs
+    // Group by segment, zmax and wmax - each segment should be sifted independently
+    // Use the original observation basename (before filtool processing)
+    obs_basename_ch = original_basename_ch
+
     ACCELSIFT(
         candidates_ch
-            .map { dm, zmax, wmax, accel, cand, txtcand, inffile -> [zmax, wmax, accel] }
-            .groupTuple(by: [0, 1]),
+            .map { dm, segment_name, chunk_num, zmax, wmax, accel, cand, txtcand, inffile ->
+                // Create unique segment label combining name and chunk number
+                def segment_label = "${segment_name}_${chunk_num}"
+                [segment_label, zmax, wmax, accel]  // Only pass the accel file
+            }
+            .groupTuple(by: [0, 1, 2])  // Group by segment_label, zmax, wmax
+            .map { segment_label, zmax, wmax, accel_list ->
+                [zmax, wmax, accel_list, segment_label]  // Reorder for ACCELSIFT input
+            }
+            .combine(obs_basename_ch),
         params.sigma_threshold,
         params.period_to_search_min,
         params.period_to_search_max,
@@ -265,7 +280,7 @@ workflow {
 
     // Create a channel of [accelfile_name, accelfile_path, candfile_path, accel_inffile_path] from ACCELSEARCH output
     accel_file_map = candidates_ch
-        .map { dm, zmax, wmax, accel, cand, txtcand, inffile ->
+        .map { dm, segment_name, chunk_num, zmax, wmax, accel, cand, txtcand, inffile ->
             [accel.name, accel, cand, inffile]
         }
         .unique()
@@ -316,7 +331,7 @@ workflow {
     // Combine with original observation and all RFI products for folding
     fold_input = RFIFIND.out.rfi_products
         .combine(candidates_with_timeseries)
-        .map { obs, rfi_products, accelfile, candfile, accel_inffile, datfile, ts_inffile, candnum, dm ->
+        .map { obs, rfi_products, original_basename, accelfile, candfile, accel_inffile, datfile, ts_inffile, candnum, dm ->
             [obs, rfi_products, accelfile, candfile, accel_inffile, datfile, ts_inffile, candnum, dm]
         }
 
