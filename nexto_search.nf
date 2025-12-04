@@ -20,8 +20,8 @@ include {
     ACCELSEARCH_ZMAX0;
     ACCELSEARCH;
     ACCELSIFT;
-    PARSE_SIFTED_CANDIDATES;
-    PREPFOLD;
+    PREPFOLD_FROM_CANDFILE;
+    PSRFOLD_PULSARX;
     PREPFOLD_TIMESERIES;
     SINGLE_PULSE_SEARCH;
     MAKE_ZAPLIST
@@ -144,6 +144,12 @@ workflow {
         processed_obs = observation_ch
     }
 
+    // Extract metadata using readfile (needed for pepoch when folding with psrfold)
+    READFILE(processed_obs)
+    def obs_info_ch = READFILE.out.obs_with_info
+    processed_obs = obs_info_ch.map { obs, info -> obs }
+    def info_pair = obs_info_ch.first()
+
     // Step 1: RFI detection
     RFIFIND(
         processed_obs,
@@ -265,77 +271,56 @@ workflow {
         params.flag_remove_harmonics ? 1 : 0
     )
 
-    // Step 12: Combine fold parameters from all (zmax, wmax) combinations
-    PARSE_SIFTED_CANDIDATES(
-        ACCELSIFT.out.fold_params.collect()
-    )
+    // Step 12: Fold top candidates
+    if (params.fold_with_psrfold) {
+        // PSRFOLD: One process per sifted candidate file (one per zmax/wmax/segment combination)
+        // Each candfile is processed independently
+        // candfile format: #id dm acc F0 F1 F2 S/N
 
-    // Step 13: Fold top candidates
-    // Parse the fold_params.txt file and create fold inputs
-    top_candidates = PARSE_SIFTED_CANDIDATES.out.fold_params
-        .splitCsv(sep: '\t')
-        .map { accelfile_name, candnum, dm ->
-            [accelfile_name, candnum as Integer, dm as Double]
-        }
+        // Get any inf file for pepoch extraction (all have same pepoch)
+        any_inf_file = PREPDATA_DMTRIALS.out.timeseries
+            .map { dm, datfile, inffile -> inffile }
+            .first()
 
-    // Create a channel of [accelfile_name, accelfile_path, candfile_path, accel_inffile_path] from ACCELSEARCH output
-    accel_file_map = candidates_ch
-        .map { dm, segment_name, chunk_num, zmax, wmax, accel, cand, txtcand, inffile ->
-            [accel.name, accel, cand, inffile]
-        }
-        .unique()
+        // For each sifted candidate file, create a PSRFOLD job
+        fold_input_psrfold = RFIFIND.out.rfi_products
+            .map { obs, rfi_products, original_basename -> obs }
+            .combine(ACCELSIFT.out.sifted_candidates)
+            .map { obs, segment_label, candfile -> [obs, segment_label, candfile] }
+            .combine(any_inf_file)
 
-    // Create a combined timeseries map from both full DM trials and segments
-    // Full DM trials from PREPDATA
-    full_timeseries_map = PREPDATA_DMTRIALS.out.timeseries
-        .map { dm, datfile, inffile ->
-            [datfile.baseName, dm, datfile, inffile]
-        }
+        PSRFOLD_PULSARX(fold_input_psrfold, params.psrfold_nbin, params.psrfold_extra_flags)
+    } else {
+        // PREPFOLD: Parse each sifted candidate file line-by-line
+        // Create one PREPFOLD job per candidate (per line in each candfile)
+        // candfile format: #id dm acc F0 F1 F2 S/N
 
-    // Segment timeseries from ACCELSEARCH (optional, only for segmented searches)
-    // Note: Each segment is created multiple times (once per zmax), so we need to deduplicate
-    segment_timeseries_map = ACCELSEARCH.out.segment_timeseries
-        .map { dm, segment_name, chunk_num, datfile, inffile ->
-            [datfile.baseName, dm, datfile, inffile]
-        }
-        .unique { it[0..1] }  // Unique by [basename, dm] to avoid duplicates
+        // Parse each candfile line-by-line
+        top_candidates = ACCELSIFT.out.sifted_candidates
+            .flatMap { segment_label, candfile ->
+                // Read the file and parse each line (skip header)
+                candfile.splitCsv(sep: '\t', skip: 1).collect { row ->
+                    [segment_label, row]
+                }
+            }
+            .map { segment_label, row ->
+                def cand_id = row[0] as Integer
+                def dm = row[1] as Double
+                def acc = row[2] as Double
+                def f0 = row[3] as Double
+                def f1 = row[4] as Double
+                def f2 = row[5] as Double
+                def snr = row[6] as Double
+                [segment_label, cand_id, dm, f0, f1, f2]
+            }
 
-    // Combine both full and segment timeseries
-    all_timeseries_map = full_timeseries_map.mix(segment_timeseries_map)
-        .unique()
+        // Combine with observation and RFI products
+        fold_input_prepfold = RFIFIND.out.rfi_products
+            .map { obs, rfi_products, original_basename -> [obs, rfi_products] }
+            .combine(top_candidates)
 
-    // Combine top candidates with their actual ACCEL, CAND, and INF file paths
-    candidates_with_files = top_candidates
-        .combine(accel_file_map)
-        .filter { accelfile_name, candnum, dm, accel_name, accel_path, cand_path, accel_inffile_path ->
-            accelfile_name == accel_name
-        }
-        .map { accelfile_name, candnum, dm, accel_name, accel_path, cand_path, accel_inffile_path ->
-            // Extract the expected timeseries basename from accel filename
-            // E.g., J1818-1422_DM619.00_half_1_ACCEL_50 -> J1818-1422_DM619.00_half_1
-            def ts_basename = accel_name.replaceAll(/_ACCEL_\d+$/, '')
-            [accel_path, cand_path, accel_inffile_path, candnum, dm, ts_basename]
-        }
-
-    // Combine with timeseries files based on basename match
-    candidates_with_timeseries = candidates_with_files
-        .combine(all_timeseries_map)
-        .filter { accel_path, cand_path, accel_inffile_path, candnum, dm_from_cand, ts_basename_expected, ts_basename_actual, dm_from_ts, datfile, ts_inffile ->
-            // Match both basename and DM
-            ts_basename_expected == ts_basename_actual && Math.abs(dm_from_cand - dm_from_ts) < 0.01
-        }
-        .map { accel_path, cand_path, accel_inffile_path, candnum, dm_from_cand, ts_basename_expected, ts_basename_actual, dm_from_ts, datfile, ts_inffile ->
-            [accel_path, cand_path, accel_inffile_path, datfile, ts_inffile, candnum, dm_from_cand]
-        }
-
-    // Combine with original observation and all RFI products for folding
-    fold_input = RFIFIND.out.rfi_products
-        .combine(candidates_with_timeseries)
-        .map { obs, rfi_products, original_basename, accelfile, candfile, accel_inffile, datfile, ts_inffile, candnum, dm ->
-            [obs, rfi_products, accelfile, candfile, accel_inffile, datfile, ts_inffile, candnum, dm]
-        }
-
-    PREPFOLD(fold_input, params.npart, params.prepfold_extra_flags)
+        PREPFOLD_FROM_CANDFILE(fold_input_prepfold, params.npart, params.prepfold_extra_flags)
+    }
 
     // Step 14: Optional single pulse search (on DM trials without nobary)
     if (params.enable_single_pulse) {

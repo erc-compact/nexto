@@ -116,6 +116,7 @@ process PREPDATA {
     dm_str = String.format("%.2f", dm as Double)
     nobary_flag = nobary ? "-nobary" : ""
     mask_file = rfi_products.find { it.name.endsWith('.mask') }
+    mask_path = mask_file ? mask_file : ""
     """
     prepdata ${nobary_flag} -dm ${dm} -downsamp ${downsample} -mask ${mask_file} ${extra_flags} -o ${basename}_DM${dm_str} ${observation}
     """
@@ -171,7 +172,7 @@ process ACCELSEARCH {
     container "${params.presto_container}"
     publishDir {
         def obs_name = datfile.name.split('_DM')[0].split('_filtool')[0]
-        "${params.outdir}/${obs_name}/03_DEDISPERSION/${segment_name}"
+        "${params.outdir}/${obs_name}/03_DEDISPERSION/${segment_name}/${segment_name}_${chunk_num}"
     }, mode: 'copy', pattern: "*_ACCEL_*"
     scratch true  // Use scratch space for intermediate files
 
@@ -303,7 +304,12 @@ process ACCELSIFT {
     //tag "sift_z${zmax}_w${wmax}_${segment_label}"
     label 'presto'
     container "${params.presto_container}"
-    publishDir { "${params.outdir}/${obs_basename}/04_SIFTING" }, mode: 'copy', pattern: "*.txt"
+    publishDir {
+        def segment_parts = segment_label.split('_')
+        def segment_name = segment_parts[0..-2].join('_')
+        def chunk_num = segment_parts[-1]
+        "${params.outdir}/${obs_basename}/04_SIFTING/${segment_name}/${segment_name}_${chunk_num}"
+    }, mode: 'copy', pattern: "*.txt"
 
     input:
     tuple val(zmax), val(wmax), path(accel_files), val(segment_label), val(obs_basename)
@@ -314,8 +320,7 @@ process ACCELSIFT {
     val flag_remove_harmonics
 
     output:
-    path "best_candidates_${segment_label}_z${zmax}_w${wmax}.txt", emit: sifted_candidates
-    path "fold_params_${segment_label}_z${zmax}_w${wmax}.txt", emit: fold_params
+    tuple val(segment_label), path("best_candidates_${segment_label}_z${zmax}_w${wmax}.txt"), emit: sifted_candidates
 
     script:
     wmax_suffix = wmax > 0 ? "_JERK_${wmax}" : ""
@@ -326,8 +331,7 @@ process ACCELSIFT {
     accel_list=(*_ACCEL_${zmax}${wmax_suffix})
 
     if [ \${#accel_list[@]} -eq 0 ]; then
-        echo "No candidates found" > best_candidates_${segment_label}_z${zmax}_w${wmax}.txt
-        touch fold_params_${segment_label}_z${zmax}_w${wmax}.txt
+        echo "#id   dm acc  F0 F1 F2 S/N" > best_candidates_${segment_label}_z${zmax}_w${wmax}.txt
         exit 0
     fi
 
@@ -340,8 +344,7 @@ process ACCELSIFT {
         ${dup_flag} \
         ${harm_flag} \
         --max-cands-to-fold ${params.max_cands_to_fold} \
-        --output best_candidates_${segment_label}_z${zmax}_w${wmax}.txt \
-        --fold-params fold_params_${segment_label}_z${zmax}_w${wmax}.txt
+        --output best_candidates_${segment_label}_z${zmax}_w${wmax}.txt
     """
 }
 
@@ -349,24 +352,41 @@ process ACCELSIFT {
 // CANDIDATE PARSING
 // ============================================================================
 
-process PARSE_SIFTED_CANDIDATES {
-    tag "combine_fold_params"
+process COMBINE_SIFTED_CANDFILES {
+    tag "combine_candfiles"
     label 'presto'
     container "${params.presto_container}"
+    publishDir { "${params.outdir}/${obs_basename}/04_SIFTING" }, mode: 'copy'
 
     input:
-    path fold_param_files
+    tuple path(candfiles), val(obs_basename)
 
     output:
-    path "fold_params.txt", emit: fold_params
+    path "all_sifted_candidates.txt", emit: combined_candfile
 
     script:
     """
-    # Combine all fold_params files from different segments and (zmax, wmax) combinations
-    cat fold_params_*.txt > fold_params.txt 2>/dev/null || touch fold_params.txt
+    # Combine all candidate files, keeping only the header from the first file
+    # Format: #id dm acc F0 F1 F2 S/N
 
-    echo "Combined fold parameters from \$(ls fold_params_*.txt 2>/dev/null | wc -l) files"
-    echo "Total candidates to fold: \$(wc -l < fold_params.txt)"
+    first_file=true
+    for candfile in ${candfiles}; do
+        if [ "\$first_file" = true ]; then
+            # Keep header from first file
+            cat "\$candfile" >> all_sifted_candidates.txt
+            first_file=false
+        else
+            # Skip header from subsequent files
+            tail -n +2 "\$candfile" >> all_sifted_candidates.txt
+        fi
+    done
+
+    # If no files were found, create empty file with header
+    if [ ! -f all_sifted_candidates.txt ]; then
+        echo "#id   dm acc  F0 F1 F2 S/N" > all_sifted_candidates.txt
+    fi
+
+    echo "Combined \$(tail -n +2 all_sifted_candidates.txt | wc -l) candidates from \$(echo ${candfiles} | wc -w) files"
     """
 }
 
@@ -374,45 +394,105 @@ process PARSE_SIFTED_CANDIDATES {
 // CANDIDATE FOLDING
 // ============================================================================
 
-process PREPFOLD {
-    tag "${observation.baseName}_cand${cand_num}"
+process PREPFOLD_FROM_CANDFILE {
+    tag "${observation.baseName}_${segment_label}_cand${cand_id}"
     label 'presto'
     label 'process_high'
     container "${params.presto_container}"
     publishDir {
         def obs_name = observation.baseName.split('_filtool')[0]
-        // Extract segment label from accelfile name (e.g., _half_1 or _full)
-        def segment_label = 'full'
-        if (accelfile.name.contains('_half_')) {
-            def chunk = accelfile.name.split('_half_')[1].split('_')[0]
-            segment_label = "half_${chunk}"
-        } else if (accelfile.name.contains('_quarter_')) {
-            def chunk = accelfile.name.split('_quarter_')[1].split('_')[0]
-            segment_label = "quarter_${chunk}"
-        } else if (accelfile.name.contains('_third_')) {
-            def chunk = accelfile.name.split('_third_')[1].split('_')[0]
-            segment_label = "third_${chunk}"
-        }
-        "${params.outdir}/${obs_name}/05_FOLDING/${segment_label}"
+        def segment_parts = segment_label.split('_')
+        def segment_name = segment_parts[0..-2].join('_')
+        def chunk_num = segment_parts[-1]
+        "${params.outdir}/${obs_name}/05_FOLDING/${segment_name}/${segment_name}_${chunk_num}"
     }, mode: 'copy'
 
     input:
-    tuple path(observation), path(rfi_products), path(accelfile), path(candfile), path(accel_inffile), path(timeseries_datfile), path(timeseries_inffile), val(cand_num), val(dm)
+    tuple path(observation), path(rfi_products), val(segment_label), val(cand_id), val(dm), val(f0), val(f1), val(f2)
     val npart
     val extra_flags
 
     output:
-    tuple val(cand_num), path("*.pfd"), path("*.pfd.ps"), path("*.bestprof"), emit: folded_candidates
+    tuple val(cand_id), path("*.pfd"), path("*.pfd.ps"), path("*.pfd.bestprof"), emit: folded_candidates
 
     script:
     basename = observation.baseName
     // Find the mask file from rfi_products
     mask_file = rfi_products.find { it.name.endsWith('.mask') }
-    """
-    # Stage timeseries files so prepfold can find them
-    # (prepfold with -accelfile will look for dedispersed timeseries)
 
-    prepfold -noxwin -accelcand ${cand_num} -accelfile ${candfile} -dm ${dm} -npart ${npart} -mask ${mask_file} ${extra_flags} -o ${basename}_cand${cand_num} ${observation}
+    // Calculate period from F0
+    period = 1.0 / f0
+
+    def obs_name = observation.baseName.split('_filtool')[0]
+
+    """
+    # Fold using period and derivatives from candfile
+    # F0 = frequency (Hz), F1 = fdot (Hz/s), F2 = fddot (Hz/s^2)
+    prepfold -noxwin \\
+        -f ${f0} \\
+        -fd ${f1} \\
+        -fdd ${f2} \\
+        -dm ${dm} \\
+        -npart ${npart} \\
+        -mask ${mask_file} \\
+        ${extra_flags} \\
+        -o ${obs_name}_${segment_label}_cand${cand_id} \\
+        ${observation}
+    """
+}
+
+process PSRFOLD_PULSARX {
+    tag "${observation.baseName}_${segment_label}"
+    label 'process_high'
+    container "${params.pulsarx_container}"
+    publishDir {
+        def obs_name = observation.baseName.split('_filtool')[0]
+        def segment_parts = segment_label.split('_')
+        def segment_name = segment_parts[0..-2].join('_')
+        def chunk_num = segment_parts[-1]
+        "${params.outdir}/${obs_name}/05_FOLDING/${segment_name}/${segment_name}_${chunk_num}"
+    }, mode: 'copy'
+
+    input:
+    tuple path(observation), val(segment_label), path(candfile), path(inf_file)
+    val nbin
+    val extra_flags
+
+    output:
+    path "*.ar", optional: true, emit: folded_archives
+    path "*.png", optional: true, emit: folded_plots
+    path "*.cands", optional: true, emit: folded_cand_files
+
+    script:
+    basename = observation.baseName
+    def obs_name = observation.baseName.split('_filtool')[0]
+    """
+    #!/bin/bash
+    set -euo pipefail
+
+    # Extract pepoch from inf file
+    pepoch=\$(grep "Epoch of observation" ${inf_file} | awk -F'=' '{print \$2}' | tr -d ' ')
+
+    if [ -z "\${pepoch}" ]; then
+        echo "ERROR: Could not extract pepoch from ${inf_file}" >&2
+        exit 1
+    fi
+
+    echo "Pepoch: \${pepoch}"
+    echo "Running psrfold_fil2 on \$(tail -n +2 ${candfile} | wc -l) candidates"
+
+    # Run psrfold_fil2 with the candidate file (processes all candidates at once)
+    # The candfile is already in the correct format: #id dm acc F0 F1 F2 S/N
+    psrfold_fil \\
+        --render \\
+        --candfile ${candfile} \\
+        --pepoch \${pepoch} \\
+        --rootname ${obs_name}_${segment_label} \\
+        --nbin ${nbin} \\
+        --threads ${task.cpus} \\
+        --template ${params.fold_template} \\
+        ${extra_flags} \\
+        ${observation}
     """
 }
 
@@ -459,7 +539,7 @@ process SINGLE_PULSE_SEARCH {
     script:
     """
     single_pulse_search.py --noplot --threshold ${threshold} ${datfile}
-    """
+    """ 
 }
 
 // ============================================================================
