@@ -167,18 +167,22 @@ class Candidate(object):
         self.w = w
         self.note = ""
 
+
+
     def add_as_hit(self, other):
         self.hits.extend(other.hits)
 
     def __str__(self):
         cand = self.filename + ':' + repr(self.candnum)
-        return "%-65s   %7.2f  %6.2f  %6.2f  %s   %7.1f  %7.1f  " \
+
+        return "%-65s   %7.2f | %6.2f  %6.2f  %s   %7.1f  %7.1f  " \
                 "%12.6f  %10.2f  %8.2f  %8.2f" % \
                         (cand, self.DM, self.snr, self.sigma, \
                         "%2d".center(7)%self.numharm,
                         self.ipow_det, self.cpow, self.p*1000, self.r, self.z, self.w)
 
     def harms_to_snr(self):
+
         # Remove the average power level
         harmamps = np.asarray(self.harm_pows) - 1.0
         # Set the S/N to 0.0 for harmonics with "negative" amplitudes
@@ -673,7 +677,7 @@ class Candlist(object):
             cand = self.cands[ii]
             maxharm = np.argmax(cand.harm_pows)
             maxpow = cand.harm_pows[maxharm]
-            
+
             # Sort the harmonics by power
             sortedpows = np.sort(cand.harm_pows)
 
@@ -1110,8 +1114,8 @@ def candlist_from_candfile(filename, trackbad=False, trackdupes=False):
     current_goodcandnum = 0
     last_candnum = 0
     last_goodcandnum = 0
-
     for line in candfile:
+
         # Identify the candidates in the top of the file
         if fund_re.match(line):
             split_line = line.split()
@@ -1124,12 +1128,14 @@ def candlist_from_candfile(filename, trackbad=False, trackdupes=False):
             numharm   = int(split_line[4])
             bin       = float(split_line[7].split("(")[0])
             z         = float(split_line[9].split("(")[0])
-            w        =  float(split_line[10].split("(")[0]) if "JERK" in candfile else 0.0
+            w        =  float(split_line[10].split("(")[0]) if "JERK" in filename else 0.0
             f = bin / tobs    # Spin freq in hz
             p = 1.0 / f       # Spin period in sec
 
+
             # Add it to the candidates list
             DMstr = DM_re.search(filename).groups()[0]
+            
             cands.append(Candidate(candnum, sigma, numharm,
                                           i_pow_det, c_pow, bin, z, w,
                                           DMstr, filename, tobs))
@@ -1145,6 +1151,7 @@ def candlist_from_candfile(filename, trackbad=False, trackdupes=False):
             if len(split_line[0])==4 and last_goodcandnum >= 9999:
                 candnum = last_goodcandnum + 1
             if candnum in candnums:
+                print("Parsing harmonic for candidate %d" % candnum)
                 cand = cands[candnums.index(candnum)]
                 cand.harm_pows = np.zeros(cand.numharm, dtype=np.float64)
                 cand.harm_amps = np.zeros(cand.numharm, dtype=np.complex64) 
@@ -1170,7 +1177,6 @@ def candlist_from_candfile(filename, trackbad=False, trackdupes=False):
                     cand.hits = [(cand.DM, cand.snr, cand.sigma)]
                     cand.ipow_det = opt_ipow
             continue
-
         # Parse the higher (than the first) harmonic powers
         if current_goodcandnum:
             cand = cands[candnums.index(current_goodcandnum)]
@@ -1215,6 +1221,8 @@ def read_candidates(filenms, prelim_reject=True, track=False):
         print("\nReading candidates from %d files...." % len(filenms))
         for ii, filenm in enumerate(filenms):
             curr_candlist = candlist_from_candfile(filenm, trackbad=track, trackdupes=track)
+            print("  Read %d candidates from %s" % (len(curr_candlist), filenm))
+            print("    %d candidates passed initial reading" % len(curr_candlist))
             if prelim_reject:
                 curr_candlist.default_rejection()
             candlist.extend(curr_candlist)
