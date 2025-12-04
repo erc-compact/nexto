@@ -1124,7 +1124,7 @@ def candlist_from_candfile(filename, trackbad=False, trackdupes=False):
             numharm   = int(split_line[4])
             bin       = float(split_line[7].split("(")[0])
             z         = float(split_line[9].split("(")[0])
-            w        =  float(split_line[10].split("(")[0])
+            w        =  float(split_line[10].split("(")[0]) if "JERK" in candfile else 0.0
             f = bin / tobs    # Spin freq in hz
             p = 1.0 / f       # Spin period in sec
 
