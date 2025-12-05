@@ -1,4 +1,4 @@
-# NEXTO - Nextflow Execution of Transient Observatory
+# NEXTO - Nextflow PRESTO pipeline
 
 A scalable Nextflow implementation of [PULSAR_MINER](https://github.com/alex88ridolfi/PULSAR_MINER) for distributed cluster computing.
 
