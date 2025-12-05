@@ -1,0 +1,53 @@
+# Nextflow work directories
+work/
+.nextflow/
+.nextflow.log*
+
+# Output directories
+results/
+output/
+
+# Nextflow reports
+timeline*.html
+report*.html
+trace*.txt
+dag*.{html,svg,pdf}
+*.{html,svg,pdf}
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.claude
+
+# PRESTO outputs
+*.dat
+*.fft
+*.inf
+*.pfd
+*.ps
+*.bestprof
+*.mask
+*.zaplist
+*.cand
+*.ACCEL_*
+*.singlepulse
+
+# Logs
+*.log
