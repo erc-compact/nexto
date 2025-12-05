@@ -38,7 +38,7 @@ params.dm_step = 0.5
 params.downsample = 1
 params.search_params = [[0,0], [50,0], [200,0]]  // List of [zmax, wmax] tuples
 params.numharm = 8
-params.sigma_threshold = 6.0
+params.sigma_threshold = 2.0
 params.sigma_birdies_threshold = 15.0
 params.rfifind_time = 2.0
 params.rfifind_freqsig = 4.0
@@ -72,6 +72,14 @@ def helpMessage() {
     Output:
         --outdir               Output directory (default: results)
 
+    Filterbank Processing (PulsarX):
+        --enable_filtool       Enable filtool preprocessing (default: false)
+        --filtool_time_decimate    Time decimation factor (default: 1)
+        --filtool_freq_decimate    Frequency decimation factor (default: 1)
+        --filtool_telescope    Telescope name (default: "meerkat")
+        --filtool_rfi_filter   RFI filter string (default: "kadaneF 8 4 zdot")
+        --filtool_extra_args   Additional filtool arguments (default: "")
+
     Dedispersion:
         --dm_low               Minimum DM to search (default: 0.0)
         --dm_high              Maximum DM to search (default: 100.0)
@@ -82,6 +90,11 @@ def helpMessage() {
         --rfifind_time         Time interval for rfifind (default: 2.0)
         --rfifind_freqsig      Freq sigma for rfifind (default: 4.0)
         --rfifind_extra_flags  Additional flags for rfifind (default: "")
+
+    Segmentation:
+        --segments             List of [name, fraction] tuples (default: [["full",1.0],["half",0.5]])
+                               Each segment can be a fraction of the observation
+        --publish_timeseries   Publish .dat/.inf files (default: false, can be large)
 
     Periodicity search:
         --search_params        List of [zmax,wmax] tuples (default: [[0,0],[50,0],[200,0]])
@@ -94,12 +107,21 @@ def helpMessage() {
 
     Candidate selection:
         --sigma_threshold      Minimum sigma for candidates (default: 6.0)
-        --sigma_birdies_threshold  Minimum sigma for birdie detection (default: 4.0)
-        --npart                Number of phase bins for folding (default: 50)
-        --dmstep               DM step for prepfold (default: 1)
-        --prepfold_extra_flags Additional flags for prepfold (default: "")
+        --sigma_birdies_threshold  Minimum sigma for birdie detection (default: 15.0)
+        --period_to_search_min Minimum period to search in seconds (default: 0.001)
+        --period_to_search_max Maximum period to search in seconds (default: 15.0)
+        --flag_remove_duplicates   Remove duplicate candidates (default: true)
+        --flag_remove_harmonics    Remove harmonic candidates (default: true)
+        --max_cands_to_fold    Maximum candidates to fold (default: 100)
 
-    Optional searches:
+    Folding:
+        --fold_with_psrfold    Use PulsarX psrfold instead of PRESTO prepfold (default: false)
+        --npart                Number of phase bins for PRESTO folding (default: 50)
+        --prepfold_extra_flags Additional flags for prepfold (default: "")
+        --psrfold_nbin         Number of bins for psrfold (default: 4)
+        --psrfold_extra_flags  Additional flags for psrfold (default: "")
+
+    Single pulse search:
         --enable_single_pulse  Enable single pulse search (default: true)
         --sp_threshold         Single pulse threshold (default: 5.0)
 
