@@ -414,6 +414,7 @@ process PREPFOLD_FROM_CANDFILE {
 
     output:
     tuple val(cand_id), path("*.pfd"), path("*.pfd.ps"), path("*.pfd.bestprof"), emit: folded_candidates
+    path "*.pfd.png", optional: true, emit: folded_pngs
 
     script:
     basename = observation.baseName
@@ -441,6 +442,31 @@ process PREPFOLD_FROM_CANDFILE {
         ${extra_flags} \\
         -o ${obs_name}_${segment_label}_cand${cand_id} \\
         ${observation}
+
+    # Convert PS files to PNG
+    for psfile in *.pfd.ps; do
+        if [ -f "\${psfile}" ]; then
+            pngfile="\${psfile%.ps}.png"
+
+            # Try pstoimg first - not working for some reason
+            # if command -v pstoimg &> /dev/null; then
+            #     pstoimg -type png -density 150 -out "\${pngfile}" "\${psfile}"
+            # Try ghostscript if pstoimg not available
+            if command -v gs &> /dev/null; then
+                # Use ghostscript to convert PS to PNG with 90 degree clockwise rotation
+                # Orientation: 0=portrait, 1=landscape, 2=upside-down, 3=seascape (rotated 90° clockwise)
+                gs -dSAFER -dBATCH -dQUIET -dNOPAUSE -dEPSCrop \\
+                   -dAutoRotatePages=/None -dPDFFitPage=false \\
+                   -r300 -sDEVICE=png16m \\
+                   -sOutputFile="\${pngfile}" \\
+                   -c "<</Orientation 3>> setpagedevice" \\
+                   -f "\${psfile}"
+            else
+                echo "gs not found, skipping PNG conversion"
+                break
+            fi
+        fi
+    done
     """
 }
 
