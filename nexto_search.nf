@@ -276,14 +276,17 @@ workflow {
 
     ACCELSIFT(
         candidates_ch
-            .map { dm, segment_name, chunk_num, zmax, wmax, accel, cand, txtcand, inffile ->
+            .map { dm, segment_name, fraction, chunk_num, zmax, wmax, accel, cand, txtcand, inffile ->
                 // Create unique segment label combining name and chunk number
                 def segment_label = "${segment_name}_${chunk_num}"
-                [segment_label, zmax, wmax, accel]  // Only pass the accel file
+                // Calculate start and end fractions for this chunk
+                def start_frac = (chunk_num - 1) * fraction
+                def end_frac = chunk_num * fraction
+                [segment_label, start_frac, end_frac, zmax, wmax, accel]  // Pass accel file with fraction info
             }
-            .groupTuple(by: [0, 1, 2])  // Group by segment_label, zmax, wmax
-            .map { segment_label, zmax, wmax, accel_list ->
-                [zmax, wmax, accel_list, segment_label]  // Reorder for ACCELSIFT input
+            .groupTuple(by: [0, 1, 2, 3, 4])  // Group by segment_label, start_frac, end_frac, zmax, wmax
+            .map { segment_label, start_frac, end_frac, zmax, wmax, accel_list ->
+                [zmax, wmax, accel_list, segment_label, start_frac, end_frac]  // Reorder for ACCELSIFT input
             }
             .combine(obs_basename_ch),
         params.sigma_threshold,
@@ -308,7 +311,7 @@ workflow {
         fold_input_psrfold = RFIFIND.out.rfi_products
             .map { obs, rfi_products, original_basename -> obs }
             .combine(ACCELSIFT.out.sifted_candidates)
-            .map { obs, segment_label, candfile -> [obs, segment_label, candfile] }
+            .map { obs, segment_label, start_frac, end_frac, candfile -> [obs, segment_label, start_frac, end_frac, candfile] }
             .combine(any_inf_file)
 
         PSRFOLD_PULSARX(fold_input_psrfold, params.psrfold_nbin, params.psrfold_extra_flags)
@@ -319,13 +322,13 @@ workflow {
 
         // Parse each candfile line-by-line
         top_candidates = ACCELSIFT.out.sifted_candidates
-            .flatMap { segment_label, candfile ->
+            .flatMap { segment_label, start_frac, end_frac, candfile ->
                 // Read the file and parse each line (skip header)
                 candfile.splitCsv(sep: '\t', skip: 1).collect { row ->
-                    [segment_label, row]
+                    [segment_label, start_frac, end_frac, row]
                 }
             }
-            .map { segment_label, row ->
+            .map { segment_label, start_frac, end_frac, row ->
                 def cand_id = row[0] as Integer
                 def dm = row[1] as Double
                 def acc = row[2] as Double
@@ -333,7 +336,7 @@ workflow {
                 def f1 = row[4] as Double
                 def f2 = row[5] as Double
                 def snr = row[6] as Double
-                [segment_label, cand_id, dm, f0, f1, f2]
+                [segment_label, start_frac, end_frac, cand_id, dm, f0, f1, f2]
             }
 
         // Combine with observation and RFI products

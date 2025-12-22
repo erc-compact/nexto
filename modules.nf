@@ -185,7 +185,7 @@ process ACCELSEARCH {
     val extra_flags
 
     output:
-    tuple val(dm), val(segment_name), val(chunk_num), val(zmax), val(wmax), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.cand"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.txtcand"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.inf"), emit: candidates
+    tuple val(dm), val(segment_name), val(fraction), val(chunk_num), val(zmax), val(wmax), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.cand"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.txtcand"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.inf"), emit: candidates
     tuple val(dm), val(segment_name), val(chunk_num), path("*_${segment_name}_${chunk_num}.dat"), path("*_${segment_name}_${chunk_num}.inf"), emit: segment_timeseries, optional: true
 
     script:
@@ -312,7 +312,7 @@ process ACCELSIFT {
     }, mode: 'copy', pattern: "*.txt"
 
     input:
-    tuple val(zmax), val(wmax), path(accel_files), val(segment_label), val(obs_basename)
+    tuple val(zmax), val(wmax), path(accel_files), val(segment_label), val(start_frac), val(end_frac), val(obs_basename)
     val sigma_threshold
     val period_min
     val period_max
@@ -320,7 +320,7 @@ process ACCELSIFT {
     val flag_remove_harmonics
 
     output:
-    tuple val(segment_label), path("best_candidates_${segment_label}_z${zmax}_w${wmax}.txt"), emit: sifted_candidates
+    tuple val(segment_label), val(start_frac), val(end_frac), path("best_candidates_${segment_label}_z${zmax}_w${wmax}.txt"), emit: sifted_candidates
 
     script:
     wmax_suffix = wmax > 0 ? "_JERK_${wmax}" : ""
@@ -408,7 +408,7 @@ process PREPFOLD_FROM_CANDFILE {
     }, mode: 'copy'
 
     input:
-    tuple path(observation), path(rfi_products), val(segment_label), val(cand_id), val(dm), val(f0), val(f1), val(f2)
+    tuple path(observation), path(rfi_products), val(segment_label), val(start_frac), val(end_frac), val(cand_id), val(dm), val(f0), val(f1), val(f2)
     val npart
     val extra_flags
 
@@ -428,6 +428,7 @@ process PREPFOLD_FROM_CANDFILE {
     """
     # Fold using period and derivatives from candfile
     # F0 = frequency (Hz), F1 = fdot (Hz/s), F2 = fddot (Hz/s^2)
+    # Folding fraction: ${start_frac} to ${end_frac}
     prepfold -noxwin \\
         -f ${f0} \\
         -fd ${f1} \\
@@ -435,6 +436,8 @@ process PREPFOLD_FROM_CANDFILE {
         -dm ${dm} \\
         -npart ${npart} \\
         -mask ${mask_file} \\
+        -start ${start_frac} \\
+        -end ${end_frac} \\
         ${extra_flags} \\
         -o ${obs_name}_${segment_label}_cand${cand_id} \\
         ${observation}
@@ -454,7 +457,7 @@ process PSRFOLD_PULSARX {
     }, mode: 'copy'
 
     input:
-    tuple path(observation), val(segment_label), path(candfile), path(inf_file)
+    tuple path(observation), val(segment_label), val(start_frac), val(end_frac), path(candfile), path(inf_file)
     val nbin
     val extra_flags
 
@@ -479,9 +482,10 @@ process PSRFOLD_PULSARX {
     fi
 
     echo "Pepoch: \${pepoch}"
-    echo "Running psrfold_fil2 on \$(tail -n +2 ${candfile} | wc -l) candidates"
+    echo "Running psrfold_fil on \$(tail -n +2 ${candfile} | wc -l) candidates"
+    echo "Folding fraction: ${start_frac} to ${end_frac}"
 
-    # Run psrfold_fil2 with the candidate file (processes all candidates at once)
+    # Run psrfold_fil with the candidate file (processes all candidates at once)
     # The candfile is already in the correct format: #id dm acc F0 F1 F2 S/N
     psrfold_fil \\
         --render \\
@@ -491,8 +495,9 @@ process PSRFOLD_PULSARX {
         --nbin ${nbin} \\
         --threads ${task.cpus} \\
         --template ${params.fold_template} \\
+        --frac ${start_frac} ${end_frac} \\
         ${extra_flags} \\
-        ${observation}
+        -fcode ${observation}
     """
 }
 
