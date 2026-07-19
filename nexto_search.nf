@@ -30,6 +30,8 @@ include {
  * Default parameters
  */
 params.input = null
+params.merge_input = false   // treat params.input glob as chunks of ONE obs, merged by filtool
+params.obs_id = null         // obs_id for the merged observation (required if merge_input)
 params.outdir = "results"
 params.dm_low = 0.0
 params.dm_high = 100.0
@@ -151,12 +153,28 @@ if (!params.input) {
  * Main workflow
  */
 workflow {
-    // Create input channel keyed by a canonical observation id: the file
-    // basename with any pre-existing _filtool suffix stripped. Every process
-    // publishes under this id, so all results of one observation land in a
-    // single directory and multiple observations (beams) never mix.
-    observation_ch = Channel.fromPath(params.input, checkIfExists: true)
-        .map { obs -> [obs.baseName.split('_filtool')[0], obs] }
+    // Create input channel keyed by a canonical observation id.
+    //
+    // Two modes:
+    //  - merge_input=true: params.input is a glob matching the time-contiguous
+    //    chunks of ONE observation (e.g. COMPACT 5-minute filterbank pieces).
+    //    They are collected, sorted by name (the zero-padded byte-offset in the
+    //    filename gives time order) and handed to FILTOOL as a single obs_id
+    //    (params.obs_id) for merging. Requires enable_filtool.
+    //  - otherwise: each matched file is its own observation, obs_id = the file
+    //    basename with any pre-existing _filtool suffix stripped.
+    if (params.merge_input) {
+        if (!params.enable_filtool)
+            error "merge_input requires enable_filtool=true (filtool merges the chunks)"
+        if (!params.obs_id)
+            error "merge_input requires --obs_id to name the merged observation"
+        observation_ch = Channel.fromPath(params.input, checkIfExists: true)
+            .toSortedList()
+            .map { chunks -> [params.obs_id, chunks] }
+    } else {
+        observation_ch = Channel.fromPath(params.input, checkIfExists: true)
+            .map { obs -> [obs.baseName.split('_filtool')[0], obs] }
+    }
 
     // Step 0: Optional filtool preprocessing
     if (params.enable_filtool) {

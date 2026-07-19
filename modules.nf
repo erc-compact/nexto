@@ -30,7 +30,11 @@ process FILTOOL {
     tuple val(obs_id), path("${outfile}_01.fil"), emit: filtered_observation
 
     script:
-    outfile = "${observation.baseName}_filtool"
+    outfile = "${obs_id}_filtool"
+    // `observation` may be a single file or a list of time-contiguous chunks
+    // (merge_input mode). filtool concatenates multiple -f inputs in the order
+    // given; the input channel already sorted them into time order.
+    input_files = (observation instanceof List ? observation : [observation]).join(' ')
     // The filtered file is too large for the work directory: write it straight
     // to its final location and symlink it back for Nextflow output handling.
     // file() makes the path absolute even when --outdir is relative.
@@ -41,7 +45,7 @@ process FILTOOL {
     filtool -t ${task.cpus} --td ${time_decimate} --fd ${freq_decimate} \
         --telescope ${telescope} -z ${rfi_filter} \
         -o ${publish_dir}/${outfile} ${extra_args} \
-        -f ${observation}
+        -f ${input_files}
 
     ln -s ${publish_dir}/${outfile}_01.fil ${outfile}_01.fil
     """
@@ -234,7 +238,16 @@ process ACCELSEARCH {
         fi
 
         # Step 4: Acceleration search
-        ${accelsearch_binary} -zmax ${zmax} ${wmax_flag} -numharm ${numharm} ${extra_flags} ${outname}.fft
+        ${accelsearch_binary} -zmax ${zmax} ${wmax_flag} -numharm ${numharm} ${extra_flags} ${outname}.fft 2>&1 | tee accelsearch_run.log
+
+        # accelsearch_cu prints "CUDA Error: out of memory" but may exit 0,
+        # which the empty-output fallback below would otherwise mask as a
+        # legitimate no-candidate result. Fail loudly so the search is not
+        # silently skipped (a large zmax*wmax jerk search can exceed GPU RAM).
+        if grep -qiE "CUDA Error|out of memory|cudaError" accelsearch_run.log; then
+            echo "ERROR: accelsearch GPU failure (zmax=${zmax} wmax=${wmax}); see accelsearch_run.log" >&2
+            exit 1
+        fi
 
         # A search that finds nothing above -sigma is a normal result (common
         # for short segments at an offset DM), but PRESTO then writes no
@@ -295,7 +308,16 @@ process ACCELSEARCH {
         fi
 
         # Step 5: Acceleration search
-        ${accelsearch_binary} -zmax ${zmax} ${wmax_flag} -numharm ${numharm} ${extra_flags} ${outname}.fft
+        ${accelsearch_binary} -zmax ${zmax} ${wmax_flag} -numharm ${numharm} ${extra_flags} ${outname}.fft 2>&1 | tee accelsearch_run.log
+
+        # accelsearch_cu prints "CUDA Error: out of memory" but may exit 0,
+        # which the empty-output fallback below would otherwise mask as a
+        # legitimate no-candidate result. Fail loudly so the search is not
+        # silently skipped (a large zmax*wmax jerk search can exceed GPU RAM).
+        if grep -qiE "CUDA Error|out of memory|cudaError" accelsearch_run.log; then
+            echo "ERROR: accelsearch GPU failure (zmax=${zmax} wmax=${wmax}); see accelsearch_run.log" >&2
+            exit 1
+        fi
 
         # A search that finds nothing above -sigma is a normal result (common
         # for short segments at an offset DM), but PRESTO then writes no
