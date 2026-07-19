@@ -1,40 +1,25 @@
-// PULSAR_MINER Nextflow Modules
-// Each module wraps a PRESTO subprocess for distributed cluster execution
-
-// ============================================================================
-// INPUT VALIDATION & METADATA EXTRACTION
-// ============================================================================
-
-process READFILE {
-    tag "$observation"
-    label 'presto'
-    container "${params.presto_container}"
-
-    input:
-    path observation
-
-    output:
-    tuple path(observation), path("${observation}.info"), emit: obs_with_info
-
-    script:
-    """
-    readfile ${observation} > ${observation}.info
-    """
-}
+// NEXTO Nextflow Modules
+// Each module wraps a PRESTO/PulsarX subprocess for distributed cluster execution
+//
+// Convention: every process takes the canonical observation id (obs_id) as the
+// first tuple element and uses it for publishDir paths and downstream joins.
+// obs_id is derived once in the workflow (input basename with any _filtool
+// suffix stripped) so all outputs of one observation land in one directory
+// and multiple observations (beams) never mix.
 
 // ============================================================================
 // FILTERBANK PREPROCESSING
 // ============================================================================
+
 process FILTOOL {
-    tag "$observation"
-    label 'presto'
+    tag "$obs_id"
+    label 'pulsarx'
     label 'process_medium'
     container "${params.pulsarx_container}"
-    publishDir "${params.outdir}/${observation.baseName}/00_FILTOOL", mode: 'copy'
     maxForks 1
 
     input:
-    path observation
+    tuple val(obs_id), path(observation)
     val time_decimate
     val freq_decimate
     val telescope
@@ -42,24 +27,23 @@ process FILTOOL {
     val extra_args
 
     output:
-    path "${basename}_filtool_01.fil", emit: filtered_observation
+    tuple val(obs_id), path("${outfile}_01.fil"), emit: filtered_observation
 
     script:
-    basename = observation.baseName
-    publishDir = "${params.outdir}/${basename}/00_FILTOOL"
-    outfile = "${basename}_filtool"
+    outfile = "${observation.baseName}_filtool"
+    // The filtered file is too large for the work directory: write it straight
+    // to its final location and symlink it back for Nextflow output handling.
+    // file() makes the path absolute even when --outdir is relative.
+    publish_dir = "${file(params.outdir)}/${obs_id}/00_FILTOOL"
     """
-    # Create publish directory and write directly to it (file is too large for work directory)
-    mkdir -p ${publishDir}
+    mkdir -p ${publish_dir}
 
-    # Run filtool with all parameters
     filtool -t ${task.cpus} --td ${time_decimate} --fd ${freq_decimate} \
         --telescope ${telescope} -z ${rfi_filter} \
-        -o ${publishDir}/${outfile} ${extra_args} \
+        -o ${publish_dir}/${outfile} ${extra_args} \
         -f ${observation}
 
-    # Create symlink in work directory for Nextflow output handling
-    ln -s ${publishDir}/${outfile}_01.fil ${outfile}_01.fil
+    ln -s ${publish_dir}/${outfile}_01.fil ${outfile}_01.fil
     """
 }
 
@@ -68,21 +52,20 @@ process FILTOOL {
 // ============================================================================
 
 process RFIFIND {
-    tag "$observation"
+    tag "$obs_id"
     label 'presto'
     label 'process_medium'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/${original_basename}/01_RFIFIND", mode: 'copy'
+    publishDir "${params.outdir}/${obs_id}/01_RFIFIND", mode: 'copy'
 
     input:
-    path observation
-    val original_basename
+    tuple val(obs_id), path(observation)
     val time_interval
     val freq_interval
     val extra_flags
 
     output:
-    tuple path(observation), path("${basename}_rfifind.*"), val(original_basename), emit: rfi_products
+    tuple val(obs_id), path(observation), path("${basename}_rfifind.*"), emit: rfi_products
     path "${basename}_rfifind.mask", emit: mask
     path "*.ps", emit: plots optional true
 
@@ -98,27 +81,49 @@ process RFIFIND {
 // ============================================================================
 
 process PREPDATA {
-    tag "${observation}_DM${dm}_nobary${nobary}"
+    tag "${obs_id}_DM${dm}_nobary${nobary}"
     label 'presto'
     label 'process_high'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/${observation.baseName.split('_filtool')[0]}/02_TIMESERIES", mode: 'copy', enabled: params.publish_timeseries
-    maxForks 2
+    publishDir "${params.outdir}/${obs_id}/02_TIMESERIES", mode: 'copy', enabled: params.publish_timeseries
 
     input:
-    tuple path(observation), path(rfi_products), val(dm), val(downsample), val(nobary), val(extra_flags)
+    tuple val(obs_id), path(observation), path(rfi_products), val(dm), val(downsample), val(nobary), val(extra_flags)
 
     output:
-    tuple val(dm), path("*.dat"), path("*.inf"), emit: timeseries
+    tuple val(obs_id), val(dm), path("*.dat"), path("*.inf"), emit: timeseries
 
     script:
     basename = observation.baseName
     dm_str = String.format("%.2f", dm as Double)
     nobary_flag = nobary ? "-nobary" : ""
     mask_file = rfi_products.find { it.name.endsWith('.mask') }
-    mask_path = mask_file ? mask_file : ""
     """
     prepdata ${nobary_flag} -dm ${dm} -downsamp ${downsample} -mask ${mask_file} ${extra_flags} -o ${basename}_DM${dm_str} ${observation}
+    """
+}
+
+// ============================================================================
+// BARYCENTRIC VELOCITY
+// ============================================================================
+
+process COMPUTE_BARYV {
+    tag "$obs_id"
+    label 'presto'
+    container "${params.presto_container}"
+    publishDir "${params.outdir}/${obs_id}/02_BIRDIES", mode: 'copy', pattern: "baryv.txt"
+
+    input:
+    tuple val(obs_id), path(inf_file)
+
+    output:
+    tuple val(obs_id), env(BARYV), emit: baryv
+    path "baryv.txt"
+
+    script:
+    """
+    compute_baryv.py ${inf_file} > baryv.txt
+    BARYV=\$(cat baryv.txt)
     """
 }
 
@@ -127,19 +132,19 @@ process PREPDATA {
 // ============================================================================
 
 process ACCELSEARCH_ZMAX0 {
-    tag "${datfile.baseName}_zmax0"
+    tag "${obs_id}_zmax0"
     label 'presto'
     label 'process_low'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/${datfile.name.split('_DM')[0].split('_filtool')[0]}/02_BIRDIES", mode: 'copy', pattern: "*_ACCEL_0*"
+    publishDir "${params.outdir}/${obs_id}/02_BIRDIES", mode: 'copy', pattern: "*_ACCEL_0*"
     scratch true  // Use scratch space for intermediate files
 
     input:
-    tuple val(dm), path(datfile), path(inffile)
+    tuple val(obs_id), val(dm), path(datfile), path(inffile)
     val numharm
 
     output:
-    tuple path("*_ACCEL_0"), path("*_ACCEL_0.cand"), path("*_ACCEL_0.txtcand"), emit: accel_zero
+    tuple val(obs_id), path("*_ACCEL_0"), path("*_ACCEL_0.cand"), path("*_ACCEL_0.txtcand"), emit: accel_zero
 
     script:
     basename = datfile.baseName
@@ -156,6 +161,14 @@ process ACCELSEARCH_ZMAX0 {
     # Step 3: Acceleration search with zmax=0 (no zapbirds for birdie detection)
     accelsearch -zmax 0 -numharm ${numharm} ${basename}_red.fft
 
+    # When nothing exceeds -sigma, PRESTO writes an empty .txtcand but no
+    # ACCEL_0 / .cand file at all, which would fail the required output glob.
+    # An observation with no zero-DM birdies is legitimate: emit empty files
+    # and let MAKE_ZAPLIST produce an empty zaplist.
+    for f in ${basename}_red_ACCEL_0 ${basename}_red_ACCEL_0.cand ${basename}_red_ACCEL_0.txtcand; do
+        [ -f "\$f" ] || touch "\$f"
+    done
+
     # Clean up intermediate files
     rm -f ${basename}_red.fft ${basename}_red.inf
     """
@@ -170,39 +183,32 @@ process ACCELSEARCH {
     label 'presto'
     label 'process_high'
     container "${params.presto_container}"
-    publishDir {
-        def obs_name = datfile.name.split('_DM')[0].split('_filtool')[0]
-        "${params.outdir}/${obs_name}/03_DEDISPERSION/${segment_name}/${segment_name}_${chunk_num}"
-    }, mode: 'copy', pattern: "*_ACCEL_*"
+    publishDir "${params.outdir}/${obs_id}/03_DEDISPERSION/${segment_name}/${segment_name}_${chunk_num}", mode: 'copy', pattern: "*_ACCEL_*"
     scratch true  // Use scratch space for intermediate files
 
     input:
-    tuple val(dm), path(datfile), path(inffile), val(segment_name), val(fraction), val(chunk_num), val(total_chunks), path(zaplist)
-    tuple val(zmax), val(wmax)
+    tuple val(obs_id), val(dm), path(datfile), path(inffile), val(segment_name), val(fraction), val(chunk_num), val(total_chunks), val(zmax), val(wmax), path(zaplist), val(baryv)
     val numharm
     val use_cuda
     val gpu_id
     val extra_flags
 
     output:
-    tuple val(dm), val(segment_name), val(fraction), val(chunk_num), val(zmax), val(wmax), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.cand"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.txtcand"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.inf"), emit: candidates
-    tuple val(dm), val(segment_name), val(chunk_num), path("*_${segment_name}_${chunk_num}.dat"), path("*_${segment_name}_${chunk_num}.inf"), emit: segment_timeseries, optional: true
+    tuple val(obs_id), val(dm), val(segment_name), val(fraction), val(chunk_num), val(zmax), val(wmax), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.cand"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.txtcand"), path("*_ACCEL_${zmax}${wmax > 0 ? "_JERK_${wmax}" : ""}.inf"), emit: candidates
+    tuple val(obs_id), val(dm), val(segment_name), val(chunk_num), path("*_${segment_name}_${chunk_num}.dat"), path("*_${segment_name}_${chunk_num}.inf"), emit: segment_timeseries, optional: true
 
     script:
     basename = datfile.baseName
     accelsearch_binary = use_cuda ? "accelsearch_cu" : "accelsearch"
     wmax_flag = wmax > 0 ? "-wmax ${wmax}" : "-wmax 0"
     // Construct proper output suffix for jerk searches
-    jerk_suffix = wmax > 0 ? "_JERK_${wmax}" : ""    
-
+    jerk_suffix = wmax > 0 ? "_JERK_${wmax}" : ""
 
     if (fraction == 1.0) {
         // Full observation - no splitting
         outname = "${basename}"
         """
         #!/bin/bash
-
-
 
         # Step 1: FFT (realfft creates .fft from .dat, .inf stays the same)
         realfft ${datfile}
@@ -213,10 +219,11 @@ process ACCELSEARCH {
         rm -f ${outname}.fft  # Clean up intermediate FFT
 
         # Step 3: Zapbirds (only if zaplist is provided and not empty)
+        # The zaplist frequencies are topocentric (from the -nobary zero-DM
+        # search) while this FFT is barycentered: -baryv shifts each birdie
+        # to its apparent barycentric frequency before zapping.
         if [ -f "${zaplist}" ] && [ -s "${zaplist}" ]; then
-            # zapbirds creates new .fft file, need to rename _red.fft to match
-            zapbirds -zap -zapfile ${zaplist} ${outname}_red.fft
-            # zapbirds outputs ${outname}_red.fft (overwrites input), so rename to final name
+            zapbirds -zap -zapfile ${zaplist} -baryv ${baryv} ${outname}_red.fft
             mv ${outname}_red.fft ${outname}.fft
             cp ${outname}_red.inf ${outname}.inf
             rm -f ${outname}_red.inf
@@ -228,6 +235,14 @@ process ACCELSEARCH {
 
         # Step 4: Acceleration search
         ${accelsearch_binary} -zmax ${zmax} ${wmax_flag} -numharm ${numharm} ${extra_flags} ${outname}.fft
+
+        # A search that finds nothing above -sigma is a normal result (common
+        # for short segments at an offset DM), but PRESTO then writes no
+        # ACCEL/.cand file at all. Emit empty ones so this task succeeds and
+        # only contributes no candidates; ACCELSIFT skips empty ACCEL files.
+        for f in ${outname}_ACCEL_${zmax}${jerk_suffix} ${outname}_ACCEL_${zmax}${jerk_suffix}.cand ${outname}_ACCEL_${zmax}${jerk_suffix}.txtcand; do
+            [ -f "\$f" ] || touch "\$f"
+        done
 
         # Keep inf file for output (ACCEL file is named ${outname}_ACCEL_${zmax}${jerk_suffix})
         cp ${outname}.inf ${outname}_ACCEL_${zmax}${jerk_suffix}.inf
@@ -266,10 +281,10 @@ process ACCELSEARCH {
         rm -f ${outname}.fft  # Clean up intermediate FFT
 
         # Step 4: Zapbirds (only if zaplist is provided and not empty)
+        # See full-observation branch: -baryv corrects the topocentric
+        # birdie frequencies for this barycentered FFT.
         if [ -f "${zaplist}" ] && [ -s "${zaplist}" ]; then
-            # zapbirds creates new .fft file
-            zapbirds -zap -zapfile ${zaplist} ${outname}_red.fft
-            # Rename to final name
+            zapbirds -zap -zapfile ${zaplist} -baryv ${baryv} ${outname}_red.fft
             mv ${outname}_red.fft ${outname}.fft
             cp ${outname}_red.inf ${outname}.inf
             rm -f ${outname}_red.inf
@@ -282,15 +297,19 @@ process ACCELSEARCH {
         # Step 5: Acceleration search
         ${accelsearch_binary} -zmax ${zmax} ${wmax_flag} -numharm ${numharm} ${extra_flags} ${outname}.fft
 
+        # A search that finds nothing above -sigma is a normal result (common
+        # for short segments at an offset DM), but PRESTO then writes no
+        # ACCEL/.cand file at all. Emit empty ones so this task succeeds and
+        # only contributes no candidates; ACCELSIFT skips empty ACCEL files.
+        for f in ${outname}_ACCEL_${zmax}${jerk_suffix} ${outname}_ACCEL_${zmax}${jerk_suffix}.cand ${outname}_ACCEL_${zmax}${jerk_suffix}.txtcand; do
+            [ -f "\$f" ] || touch "\$f"
+        done
+
         # Keep inf file for output (ACCEL file is named ${outname}_ACCEL_${zmax}${jerk_suffix})
         cp ${outname}.inf ${outname}_ACCEL_${zmax}${jerk_suffix}.inf
 
-        # Keep segment timeseries files for prepfold (dat and inf with segment name)
-        # These were created by prepdata -start in Step 1
-        # They should already be named ${outname}.dat and ${outname}.inf
-        # Just need to keep them (don't delete)
-
-        # Clean up FFT files only (keep segment timeseries dat/inf for prepfold)
+        # Keep segment timeseries files (dat and inf) for later folding.
+        # Clean up FFT files only.
         rm -f ${outname}.fft
         """
     }
@@ -301,18 +320,17 @@ process ACCELSEARCH {
 // ============================================================================
 
 process ACCELSIFT {
-    //tag "sift_z${zmax}_w${wmax}_${segment_label}"
+    tag "${obs_id}_${segment_label}"
     label 'presto'
     container "${params.presto_container}"
     publishDir {
         def segment_parts = segment_label.split('_')
         def segment_name = segment_parts[0..-2].join('_')
-        def chunk_num = segment_parts[-1]
-        "${params.outdir}/${obs_basename}/04_SIFTING/${segment_name}/${segment_name}_${chunk_num}"
+        "${params.outdir}/${obs_id}/04_SIFTING/${segment_name}/${segment_label}"
     }, mode: 'copy', pattern: "*.txt"
 
     input:
-    tuple val(zmax), val(wmax), path(accel_files), val(segment_label), val(start_frac), val(end_frac), val(obs_basename)
+    tuple val(obs_id), val(segment_label), val(start_frac), val(end_frac), path(accel_files)
     val sigma_threshold
     val period_min
     val period_max
@@ -320,22 +338,30 @@ process ACCELSIFT {
     val flag_remove_harmonics
 
     output:
-    tuple val(segment_label), val(start_frac), val(end_frac), path("best_candidates_${segment_label}_z${zmax}_w${wmax}.txt"), emit: sifted_candidates
+    tuple val(obs_id), val(segment_label), val(start_frac), val(end_frac), path(outfile), emit: sifted_candidates
 
     script:
-    wmax_suffix = wmax > 0 ? "_JERK_${wmax}" : ""
+    outfile = "best_candidates_${obs_id}_${segment_label}.txt"
     dup_flag = flag_remove_duplicates ? "--remove-duplicates" : ""
     harm_flag = flag_remove_harmonics ? "--remove-harmonics" : ""
     """
-    # Find all ACCEL files for this zmax/wmax combination
-    accel_list=(*_ACCEL_${zmax}${wmax_suffix})
+    # All staged files are ACCEL result files for this (observation, segment
+    # chunk): every DM trial and every zmax/wmax search is sifted together so
+    # duplicates and harmonics are removed across search configurations.
+    # Skip empty ACCEL files: ACCELSEARCH emits one whenever a search found
+    # nothing above -sigma, and PRESTO's sifting cannot parse a file with no
+    # header (it dies on an unset numsamp).
+    shopt -s nullglob
+    accel_list=()
+    for f in *_ACCEL_*; do
+        [ -s "\$f" ] && accel_list+=("\$f")
+    done
 
     if [ \${#accel_list[@]} -eq 0 ]; then
-        echo "#id   dm acc  F0 F1 F2 S/N" > best_candidates_${segment_label}_z${zmax}_w${wmax}.txt
+        echo "#id   dm acc  F0 F1 F2 S/N" > ${outfile}
         exit 0
     fi
 
-    # Run custom sifting script
     ${projectDir}/bin/sift_candidates.py \
         \${accel_list[@]} \
         --min-period ${period_min} \
@@ -344,49 +370,7 @@ process ACCELSIFT {
         ${dup_flag} \
         ${harm_flag} \
         --max-cands-to-fold ${params.max_cands_to_fold} \
-        --output best_candidates_${segment_label}_z${zmax}_w${wmax}.txt
-    """
-}
-
-// ============================================================================
-// CANDIDATE PARSING
-// ============================================================================
-
-process COMBINE_SIFTED_CANDFILES {
-    tag "combine_candfiles"
-    label 'presto'
-    container "${params.presto_container}"
-    publishDir { "${params.outdir}/${obs_basename}/04_SIFTING" }, mode: 'copy'
-
-    input:
-    tuple path(candfiles), val(obs_basename)
-
-    output:
-    path "all_sifted_candidates.txt", emit: combined_candfile
-
-    script:
-    """
-    # Combine all candidate files, keeping only the header from the first file
-    # Format: #id dm acc F0 F1 F2 S/N
-
-    first_file=true
-    for candfile in ${candfiles}; do
-        if [ "\$first_file" = true ]; then
-            # Keep header from first file
-            cat "\$candfile" >> all_sifted_candidates.txt
-            first_file=false
-        else
-            # Skip header from subsequent files
-            tail -n +2 "\$candfile" >> all_sifted_candidates.txt
-        fi
-    done
-
-    # If no files were found, create empty file with header
-    if [ ! -f all_sifted_candidates.txt ]; then
-        echo "#id   dm acc  F0 F1 F2 S/N" > all_sifted_candidates.txt
-    fi
-
-    echo "Combined \$(tail -n +2 all_sifted_candidates.txt | wc -l) candidates from \$(echo ${candfiles} | wc -w) files"
+        --output ${outfile}
     """
 }
 
@@ -395,20 +379,18 @@ process COMBINE_SIFTED_CANDFILES {
 // ============================================================================
 
 process PREPFOLD_FROM_CANDFILE {
-    tag "${observation.baseName}_${segment_label}_cand${cand_id}"
+    tag "${obs_id}_${segment_label}_cand${cand_id}"
     label 'presto'
     label 'process_high'
     container "${params.presto_container}"
     publishDir {
-        def obs_name = observation.baseName.split('_filtool')[0]
         def segment_parts = segment_label.split('_')
         def segment_name = segment_parts[0..-2].join('_')
-        def chunk_num = segment_parts[-1]
-        "${params.outdir}/${obs_name}/05_FOLDING/${segment_name}/${segment_name}_${chunk_num}"
+        "${params.outdir}/${obs_id}/05_FOLDING/${segment_name}/${segment_label}"
     }, mode: 'copy'
 
     input:
-    tuple path(observation), path(rfi_products), val(segment_label), val(start_frac), val(end_frac), val(cand_id), val(dm), val(f0), val(f1), val(f2)
+    tuple val(obs_id), path(observation), path(rfi_products), val(segment_label), val(start_frac), val(end_frac), val(cand_id), val(dm), val(f0), val(f1), val(f2)
     val npart
     val extra_flags
 
@@ -417,19 +399,12 @@ process PREPFOLD_FROM_CANDFILE {
     path "*.pfd.png", optional: true, emit: folded_pngs
 
     script:
-    basename = observation.baseName
     // Find the mask file from rfi_products
     mask_file = rfi_products.find { it.name.endsWith('.mask') }
-
-    // Calculate period from F0
-    period = 1.0 / f0
-
-    def obs_name = observation.baseName.split('_filtool')[0]
-
     """
-    # Fold using period and derivatives from candfile
-    # F0 = frequency (Hz), F1 = fdot (Hz/s), F2 = fddot (Hz/s^2)
-    # Folding fraction: ${start_frac} to ${end_frac}
+    # Fold using frequency and derivatives from the candfile.
+    # F0/F1/F2 are barycentric, referenced to the start of the folded section;
+    # prepfold barycenters raw data by default, so they can be used directly.
     prepfold -noxwin \\
         -f ${f0} \\
         -fd ${f1} \\
@@ -440,21 +415,15 @@ process PREPFOLD_FROM_CANDFILE {
         -start ${start_frac} \\
         -end ${end_frac} \\
         ${extra_flags} \\
-        -o ${obs_name}_${segment_label}_cand${cand_id} \\
+        -o ${obs_id}_${segment_label}_cand${cand_id} \\
         ${observation}
 
     # Convert PS files to PNG
     for psfile in *.pfd.ps; do
         if [ -f "\${psfile}" ]; then
             pngfile="\${psfile%.ps}.png"
-
-            # Try pstoimg first - not working for some reason
-            # if command -v pstoimg &> /dev/null; then
-            #     pstoimg -type png -density 150 -out "\${pngfile}" "\${psfile}"
-            # Try ghostscript if pstoimg not available
             if command -v gs &> /dev/null; then
                 # Use ghostscript to convert PS to PNG with 90 degree clockwise rotation
-                # Orientation: 0=portrait, 1=landscape, 2=upside-down, 3=seascape (rotated 90° clockwise)
                 gs -dSAFER -dBATCH -dQUIET -dNOPAUSE -dEPSCrop \\
                    -dAutoRotatePages=/None -dPDFFitPage=false \\
                    -r300 -sDEVICE=png16m \\
@@ -471,20 +440,21 @@ process PREPFOLD_FROM_CANDFILE {
 }
 
 process PSRFOLD_PULSARX {
-    tag "${observation.baseName}_${segment_label}"
+    tag "${obs_id}_${segment_label}"
+    label 'pulsarx'
     label 'process_high'
     container "${params.pulsarx_container}"
     publishDir {
-        def obs_name = observation.baseName.split('_filtool')[0]
         def segment_parts = segment_label.split('_')
         def segment_name = segment_parts[0..-2].join('_')
-        def chunk_num = segment_parts[-1]
-        "${params.outdir}/${obs_name}/05_FOLDING/${segment_name}/${segment_name}_${chunk_num}"
+        "${params.outdir}/${obs_id}/05_FOLDING/${segment_name}/${segment_label}"
     }, mode: 'copy'
 
     input:
-    tuple path(observation), val(segment_label), val(start_frac), val(end_frac), path(candfile), path(inf_file)
+    tuple val(obs_id), path(observation), val(segment_label), val(start_frac), val(end_frac), path(candfile), path(topo_inf), val(baryv)
     val nbin
+    val nsubint
+    val coherent_dm
     val extra_flags
 
     output:
@@ -493,59 +463,54 @@ process PSRFOLD_PULSARX {
     path "*.cands", optional: true, emit: folded_cand_files
 
     script:
-    basename = observation.baseName
-    def obs_name = observation.baseName.split('_filtool')[0]
+    topo_candfile = "${candfile.baseName}_topo.candfile"
     """
     #!/bin/bash
     set -euo pipefail
 
-    # Extract pepoch from inf file
-    pepoch=\$(grep "Epoch of observation" ${inf_file} | awk -F'=' '{print \$2}' | tr -d ' ')
-
-    if [ -z "\${pepoch}" ]; then
-        echo "ERROR: Could not extract pepoch from ${inf_file}" >&2
-        exit 1
+    ncands=\$(grep -c -v '^#' ${candfile} || true)
+    if [ "\${ncands}" -eq 0 ]; then
+        echo "No candidates to fold for ${obs_id} ${segment_label}"
+        exit 0
     fi
 
-    echo "Pepoch: \${pepoch}"
-    echo "Running psrfold_fil on \$(tail -n +2 ${candfile} | wc -l) candidates"
-    echo "Folding fraction: ${start_frac} to ${end_frac}"
+    # The candfile F0/F1/F2 are barycentric and referenced to the segment
+    # start; psrfold_fil folds the raw topocentric filterbank. Convert the
+    # spin parameters to topocentric and compute the topocentric pepoch of
+    # the segment start (topo obs start + start_frac * Tobs).
+    pepoch=\$(prepare_psrfold_cands.py ${candfile} ${topo_inf} --start-frac=${start_frac} --baryv=${baryv} --output ${topo_candfile})
 
-    # Run psrfold_fil with the candidate file (processes all candidates at once)
-    # The candfile is already in the correct format: #id dm acc F0 F1 F2 S/N
+    echo "Pepoch (topocentric MJD of segment start): \${pepoch}"
+    echo "Folding \${ncands} candidates, fraction ${start_frac} to ${end_frac}"
+
+    # Subint length so every plot has a constant ${nsubint} subintegrations
+    # regardless of segment length: L = (segment duration) / nsubint, where
+    # the segment duration is (end_frac - start_frac) * Tobs of the full
+    # observation, taken from the topocentric .inf (dt * N).
+    dt=\$(awk -F'=' '/Width of each time series bin/ {gsub(/ /,"",\$2); print \$2}' ${topo_inf})
+    nbins=\$(awk -F'=' '/Number of bins in the time series/ {gsub(/ /,"",\$2); print \$2}' ${topo_inf})
+    tsubint=\$(awk "BEGIN {printf \\"%.6f\\", \$dt * \$nbins * (${end_frac} - ${start_frac}) / ${nsubint}}")
+    echo "Subint length: \${tsubint} s (segment duration / ${nsubint})"
+
     psrfold_fil \\
         --render \\
-        --candfile ${candfile} \\
+        --candfile ${topo_candfile} \\
         --pepoch \${pepoch} \\
-        --rootname ${obs_name}_${segment_label} \\
+        --rootname ${obs_id}_${segment_label} \\
         --nbin ${nbin} \\
+        -L \${tsubint} \\
+        --cdm ${coherent_dm} \\
         --threads ${task.cpus} \\
         --template ${params.fold_template} \\
         --frac ${start_frac} ${end_frac} \\
         ${extra_flags} \\
-        -fcode ${observation}
-    """
-}
+        -f ${observation}
 
-process PREPFOLD_TIMESERIES {
-    tag "${datfile.baseName}_cand${cand_num}"
-    label 'presto'
-    label 'process_high'
-    container "${params.presto_container}"
-    publishDir "${params.outdir}/${datfile.name.split('_DM')[0].split('_filtool')[0]}/05_FOLDING", mode: 'copy'
-
-    input:
-    tuple val(dm), path(datfile), path(inffile), val(cand_num), val(period), val(accel)
-    val npart
-    val extra_flags
-
-    output:
-    tuple val(cand_num), path("*.pfd"), path("*.pfd.ps"), path("*.bestprof"), emit: folded_candidates
-
-    script:
-    basename = datfile.baseName
-    """
-    prepfold -noxwin -p ${period} -pd ${accel} -npart ${npart} ${extra_flags} -o ${basename}_cand${cand_num} ${datfile}
+    # psrfold_fil exits 0 even on fatal errors - fail loudly if no archives
+    if ! ls *.ar > /dev/null 2>&1; then
+        echo "ERROR: psrfold_fil produced no archives" >&2
+        exit 1
+    fi
     """
 }
 
@@ -558,19 +523,36 @@ process SINGLE_PULSE_SEARCH {
     label 'presto'
     label 'process_medium'
     container "${params.presto_container}"
-    publishDir "${params.outdir}/${datfile.name.split('_DM')[0].split('_filtool')[0]}/06_SINGLE_PULSES", mode: 'copy'
+    publishDir "${params.outdir}/${obs_id}/06_SINGLE_PULSES", mode: 'copy'
 
     input:
-    tuple val(dm), path(datfile), path(inffile)
+    tuple val(obs_id), val(dm), path(datfile), path(inffile)
     val threshold
 
     output:
-    tuple val(dm), path("*.singlepulse"), emit: single_pulses
+    tuple val(obs_id), val(dm), path("*.singlepulse"), emit: single_pulses
 
     script:
     """
-    single_pulse_search.py --noplot --threshold ${threshold} ${datfile}
-    """ 
+    # Some PRESTO images ship a copy of this script without the exec bit
+    # early in PATH; bash aborts on it instead of skipping it (unlike dash
+    # and execvp), so resolve a usable copy manually and run it via python3.
+    sps=""
+    IFS=':'
+    for d in \$PATH; do
+        if [ -f "\$d/single_pulse_search.py" ]; then
+            [ -z "\$sps" ] && sps="\$d/single_pulse_search.py"
+            [ -x "\$d/single_pulse_search.py" ] && { sps="\$d/single_pulse_search.py"; break; }
+        fi
+    done
+    unset IFS
+    if [ -z "\$sps" ]; then
+        echo "ERROR: single_pulse_search.py not found in PATH" >&2
+        exit 1
+    fi
+
+    python3 "\$sps" --noplot --threshold ${threshold} ${datfile}
+    """
 }
 
 // ============================================================================
@@ -578,22 +560,17 @@ process SINGLE_PULSE_SEARCH {
 // ============================================================================
 
 process MAKE_ZAPLIST {
-    tag "create_zaplist"
+    tag "$obs_id"
     label 'presto'
     container "${params.presto_container}"
-
-    publishDir {
-        def first_file = accel_files instanceof List ? accel_files[0] : accel_files
-        "${params.outdir}/${first_file.name.split('_DM')[0].split('_filtool')[0]}/02_BIRDIES"
-    }, mode: 'copy'
+    publishDir "${params.outdir}/${obs_id}/02_BIRDIES", mode: 'copy'
 
     input:
-    path accel_files
-    path inf_file
+    tuple val(obs_id), path(accel_files), path(inf_file)
     val sigma_threshold
 
     output:
-    path "birdies.zaplist", emit: zaplist
+    tuple val(obs_id), path("birdies.zaplist"), emit: zaplist
     path "birdies.birds", emit: birds optional true
 
     script:
@@ -688,28 +665,5 @@ process MAKE_ZAPLIST {
     else:
         print("No birdies found, creating empty zaplist")
         open("birdies.zaplist", "w").close()
-    """
-}
-
-process COMBINE_CANDIDATES {
-    tag "combine_all_dms"
-    label 'presto'
-    container "${params.presto_container}"
-
-    // Extract observation basename from first cand file
-    publishDir {
-        def first_file = all_cand_files instanceof List ? all_cand_files[0] : all_cand_files
-        "${params.outdir}/${first_file.name.split('_DM')[0]}/04_SIFTING"
-    }, mode: 'copy'
-
-    input:
-    path all_cand_files
-
-    output:
-    path "all_candidates.txt", emit: combined_cands
-
-    script:
-    """
-    cat *_ACCEL_*.cand | grep -v "^#" | sort -k2 -rn > all_candidates.txt
     """
 }

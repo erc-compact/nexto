@@ -12,17 +12,16 @@ nextflow.enable.dsl=2
 
 // Import modules
 include {
-    READFILE;
     FILTOOL;
     RFIFIND;
     PREPDATA as PREPDATA_ZERODM;
     PREPDATA as PREPDATA_DMTRIALS;
+    COMPUTE_BARYV;
     ACCELSEARCH_ZMAX0;
     ACCELSEARCH;
     ACCELSIFT;
     PREPFOLD_FROM_CANDFILE;
     PSRFOLD_PULSARX;
-    PREPFOLD_TIMESERIES;
     SINGLE_PULSE_SEARCH;
     MAKE_ZAPLIST
 } from './modules.nf'
@@ -37,6 +36,10 @@ params.dm_high = 100.0
 params.dm_step = 0.5
 params.downsample = 1
 params.search_params = [[0,0], [50,0], [200,0]]  // List of [zmax, wmax] tuples
+// Jerk searches (wmax > 0) only run on segments whose fraction is >= this
+// value. 0.0 = no restriction (every search_params tuple runs on every
+// segment); e.g. 0.5 restricts jerk searches to the full and half segments.
+params.jerk_min_fraction = 0.0
 params.numharm = 8
 params.sigma_threshold = 2.0
 params.sigma_birdies_threshold = 15.0
@@ -47,7 +50,6 @@ params.prepdata_extra_flags = ""
 params.accelsearch_extra_flags = ""
 params.prepfold_extra_flags = ""
 params.npart = 50
-params.dmstep = 1
 params.use_cuda = false
 params.gpu_id = 0
 params.sp_threshold = 5.0
@@ -67,13 +69,15 @@ def helpMessage() {
         nextflow run nexto_search.nf --input <obs.fil> [options]
 
     Required arguments:
-        --input                Path to input observation file (.fil or .fits)
+        --input                Path to input observation file(s) (.fil or .fits).
+                               A glob pattern selects multiple observations/beams;
+                               each is processed and published independently.
 
     Output:
         --outdir               Output directory (default: results)
 
     Filterbank Processing (PulsarX):
-        --enable_filtool       Enable filtool preprocessing (default: false)
+        --enable_filtool       Enable filtool preprocessing (default: true)
         --filtool_time_decimate    Time decimation factor (default: 1)
         --filtool_freq_decimate    Frequency decimation factor (default: 1)
         --filtool_telescope    Telescope name (default: "meerkat")
@@ -99,6 +103,8 @@ def helpMessage() {
     Periodicity search:
         --search_params        List of [zmax,wmax] tuples (default: [[0,0],[50,0],[200,0]])
                                If wmax=0: acceleration search, if wmax>0: jerk search
+        --jerk_min_fraction    Only run jerk searches (wmax>0) on segments whose
+                               fraction is >= this value (default: 0.0 = all segments)
         --numharm              Number of harmonics (default: 8)
         --use_cuda             Enable GPU acceleration (default: false)
         --gpu_id               GPU device ID (default: 0)
@@ -112,13 +118,13 @@ def helpMessage() {
         --period_to_search_max Maximum period to search in seconds (default: 15.0)
         --flag_remove_duplicates   Remove duplicate candidates (default: true)
         --flag_remove_harmonics    Remove harmonic candidates (default: true)
-        --max_cands_to_fold    Maximum candidates to fold (default: 100)
+        --max_cands_to_fold    Maximum candidates to fold per segment (default: 100)
 
     Folding:
         --fold_with_psrfold    Use PulsarX psrfold instead of PRESTO prepfold (default: false)
-        --npart                Number of phase bins for PRESTO folding (default: 50)
+        --npart                Number of subintegrations for PRESTO folding (default: 50)
         --prepfold_extra_flags Additional flags for prepfold (default: "")
-        --psrfold_nbin         Number of bins for psrfold (default: 4)
+        --psrfold_nbin         Number of phase bins for psrfold (default: 64)
         --psrfold_extra_flags  Additional flags for psrfold (default: "")
 
     Single pulse search:
@@ -145,11 +151,12 @@ if (!params.input) {
  * Main workflow
  */
 workflow {
-    // Create input channel
+    // Create input channel keyed by a canonical observation id: the file
+    // basename with any pre-existing _filtool suffix stripped. Every process
+    // publishes under this id, so all results of one observation land in a
+    // single directory and multiple observations (beams) never mix.
     observation_ch = Channel.fromPath(params.input, checkIfExists: true)
-
-    // Capture original observation basename before any processing
-    original_basename_ch = observation_ch.map { obs -> obs.baseName }.first()
+        .map { obs -> [obs.baseName.split('_filtool')[0], obs] }
 
     // Step 0: Optional filtool preprocessing
     if (params.enable_filtool) {
@@ -166,16 +173,9 @@ workflow {
         processed_obs = observation_ch
     }
 
-    // Extract metadata using readfile (needed for pepoch when folding with psrfold)
-    READFILE(processed_obs)
-    def obs_info_ch = READFILE.out.obs_with_info
-    processed_obs = obs_info_ch.map { obs, info -> obs }
-    def info_pair = obs_info_ch.first()
-
     // Step 1: RFI detection
     RFIFIND(
         processed_obs,
-        original_basename_ch,
         params.rfifind_time,
         params.rfifind_freqsig,
         params.rfifind_extra_flags
@@ -183,12 +183,23 @@ workflow {
 
     // Step 2: Zero-DM prepdata with -nobary for birdie detection
     zero_dm_input = RFIFIND.out.rfi_products
-        .map { obs, rfi_products, original_basename ->
-            [obs, rfi_products, 0.0, params.downsample, true, params.prepdata_extra_flags]
+        .map { obs_id, obs, rfi_products ->
+            [obs_id, obs, rfi_products, 0.0, params.downsample, true, params.prepdata_extra_flags]
         }
 
     // Run prepdata with DM=0 and nobary=true
     PREPDATA_ZERODM(zero_dm_input)
+
+    // Topocentric .inf of each observation: used for the barycentric velocity
+    // and (with psrfold) for the topocentric pepoch of segment starts
+    topo_inf_ch = PREPDATA_ZERODM.out.timeseries
+        .map { obs_id, dm, datfile, inffile -> [obs_id, inffile] }
+
+    // Average barycentric velocity (v/c) per observation, needed to apply the
+    // topocentric zaplist to barycentered FFTs (zapbirds -baryv) and to
+    // convert candidate frequencies for topocentric psrfold folding
+    COMPUTE_BARYV(topo_inf_ch)
+    baryv_ch = COMPUTE_BARYV.out.baryv
 
     // Step 3: Identify birdies (RFI lines) using z=0 search on zero-DM
     // ACCELSEARCH_ZMAX0 will do FFT, rednoise, and accelsearch internally
@@ -197,36 +208,37 @@ workflow {
         params.numharm
     )
 
-    // Step 4: Create zaplist from birdies (use ACCEL_0 files)
+    // Step 4: Create zaplist from birdies (per observation)
     MAKE_ZAPLIST(
         ACCELSEARCH_ZMAX0.out.accel_zero
-            .map { accel, cand, txtcand -> accel }
-            .collect(),
-        PREPDATA_ZERODM.out.timeseries
-            .map { dm, datfile, inffile -> inffile }
-            .first(),
+            .map { obs_id, accel, cand, txtcand -> [obs_id, accel] }
+            .join(topo_inf_ch),
         params.sigma_birdies_threshold
     )
 
     // Step 5: Now do the actual DM trials WITHOUT -nobary
-    // Generate DM values as a list
-    def dm_start = params.dm_low
-    def dm_end = params.dm_high
-    def dm_increment = params.dm_step
-    dm_values = []
-    for (def dm = dm_start; dm <= dm_end; dm += dm_increment) {
-        dm_values.add(dm)
+    // Generate DM values as a list (BigDecimal arithmetic avoids float drift)
+    def dm_values = []
+    def dm = new BigDecimal(params.dm_low.toString())
+    def dm_high = new BigDecimal(params.dm_high.toString())
+    def dm_step = new BigDecimal(params.dm_step.toString())
+    while (dm <= dm_high) {
+        dm_values << dm
+        dm = dm.add(dm_step)
     }
 
     // Combine observation with RFI products and DM values, with nobary=false
     dm_trials_input = RFIFIND.out.rfi_products
         .combine(Channel.from(dm_values))
-        .map { obs, rfi_products, original_basename, dm -> [obs, rfi_products, dm, params.downsample, false, params.prepdata_extra_flags] }
+        .map { obs_id, obs, rfi_products, dm_trial ->
+            [obs_id, obs, rfi_products, dm_trial, params.downsample, false, params.prepdata_extra_flags]
+        }
 
     // Run prepdata for all DM trials without -nobary
     PREPDATA_DMTRIALS(dm_trials_input)
 
-    // Step 6: Create segment channel and combine with timeseries
+    // Step 6: Create segment channel: each [name, fraction] tuple expands
+    // into its chunks (e.g. ["half", 0.5] -> chunks 1 and 2)
     segments_ch = Channel.from(params.segments)
         .map { name_fraction ->
             def segment_name = name_fraction[0]
@@ -238,57 +250,45 @@ workflow {
             (1..total_chunks).collect { chunk_num -> [segment_name, fraction, chunk_num, total_chunks] }
         }
 
-    // Combine timeseries with segments and zaplist for acceleration search
-    accel_input = PREPDATA_DMTRIALS.out.timeseries
-        .combine(segments_ch)
-        .combine(MAKE_ZAPLIST.out.zaplist)
-        .map { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zaplist ->
-            [dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zaplist]
-        }
-
-    // Step 7: Acceleration/Jerk search (includes split, FFT, rednoise, zapbirds, accelsearch)
-    // Create channel of search tuples from params
+    // Step 7: Acceleration/Jerk search (includes split, FFT, rednoise,
+    // zapbirds, accelsearch). Fan out over segments and [zmax, wmax] search
+    // tuples, then join the per-observation zaplist and baryv by obs_id.
     search_tuples_ch = Channel.from(params.search_params)
 
-    // Combine each timeseries with all search tuples
-    search_input = accel_input.combine(search_tuples_ch)
+    accel_input = PREPDATA_DMTRIALS.out.timeseries
+        .combine(segments_ch)
+        .combine(search_tuples_ch)
+        .filter { obs_id, dm_trial, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zmax, wmax ->
+            wmax == 0 || (fraction as BigDecimal) >= (params.jerk_min_fraction as BigDecimal)
+        }
+        .combine(MAKE_ZAPLIST.out.zaplist, by: 0)
+        .combine(baryv_ch, by: 0)
+        .map { obs_id, dm_trial, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zmax, wmax, zaplist, baryv ->
+            [obs_id, dm_trial, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zmax, wmax, zaplist, baryv]
+        }
 
-    // Run ACCELSEARCH for each (zmax, wmax) tuple
     ACCELSEARCH(
-        search_input.map { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zaplist, zmax, wmax ->
-            [dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zaplist]
-        },
-        search_input.map { dm, datfile, inffile, segment_name, fraction, chunk_num, total_chunks, zaplist, zmax, wmax ->
-            [zmax, wmax]
-        },
+        accel_input,
         params.numharm,
         params.use_cuda,
         params.gpu_id,
         params.accelsearch_extra_flags
     )
 
-    candidates_ch = ACCELSEARCH.out.candidates
-
-    // Step 11: Sift candidates
-    // Group by segment, zmax and wmax - each segment should be sifted independently
-    // Use the original observation basename (before filtool processing)
-    obs_basename_ch = original_basename_ch
-
+    // Step 8: Sift candidates.
+    // One sift job per (observation, segment chunk): all DM trials and all
+    // zmax/wmax searches of that chunk are sifted together, so duplicates and
+    // harmonics are removed across search configurations. Different
+    // observations (beams) are never mixed.
     ACCELSIFT(
-        candidates_ch
-            .map { dm, segment_name, fraction, chunk_num, zmax, wmax, accel, cand, txtcand, inffile ->
-                // Create unique segment label combining name and chunk number
-                def segment_label = "${segment_name}_${chunk_num}"
-                // Calculate start and end fractions for this chunk
+        ACCELSEARCH.out.candidates
+            .map { obs_id, dm_trial, segment_name, fraction, chunk_num, zmax, wmax, accel, cand, txtcand, inffile ->
+                def segment_label = "${segment_name}_${chunk_num}".toString()
                 def start_frac = (chunk_num - 1) * fraction
                 def end_frac = chunk_num * fraction
-                [segment_label, start_frac, end_frac, zmax, wmax, accel]  // Pass accel file with fraction info
+                [obs_id, segment_label, start_frac, end_frac, accel]
             }
-            .groupTuple(by: [0, 1, 2, 3, 4])  // Group by segment_label, start_frac, end_frac, zmax, wmax
-            .map { segment_label, start_frac, end_frac, zmax, wmax, accel_list ->
-                [zmax, wmax, accel_list, segment_label, start_frac, end_frac]  // Reorder for ACCELSIFT input
-            }
-            .combine(obs_basename_ch),
+            .groupTuple(by: [0, 1, 2, 3]),
         params.sigma_threshold,
         params.period_to_search_min,
         params.period_to_search_max,
@@ -296,58 +296,48 @@ workflow {
         params.flag_remove_harmonics ? 1 : 0
     )
 
-    // Step 12: Fold top candidates
+    // Step 9: Fold top candidates
     if (params.fold_with_psrfold) {
-        // PSRFOLD: One process per sifted candidate file (one per zmax/wmax/segment combination)
-        // Each candfile is processed independently
-        // candfile format: #id dm acc F0 F1 F2 S/N
-
-        // Get any inf file for pepoch extraction (all have same pepoch)
-        any_inf_file = PREPDATA_DMTRIALS.out.timeseries
-            .map { dm, datfile, inffile -> inffile }
-            .first()
-
-        // For each sifted candidate file, create a PSRFOLD job
+        // PSRFOLD: one job per sifted candidate file (one per segment chunk).
+        // The candfile spin parameters are converted to topocentric values
+        // inside the process (psrfold folds the raw filterbank and does no
+        // barycentric correction); pepoch is the topocentric segment start.
         fold_input_psrfold = RFIFIND.out.rfi_products
-            .map { obs, rfi_products, original_basename -> obs }
-            .combine(ACCELSIFT.out.sifted_candidates)
-            .map { obs, segment_label, start_frac, end_frac, candfile -> [obs, segment_label, start_frac, end_frac, candfile] }
-            .combine(any_inf_file)
+            .map { obs_id, obs, rfi_products -> [obs_id, obs] }
+            .combine(ACCELSIFT.out.sifted_candidates, by: 0)
+            .combine(topo_inf_ch, by: 0)
+            .combine(baryv_ch, by: 0)
 
-        PSRFOLD_PULSARX(fold_input_psrfold, params.psrfold_nbin, params.psrfold_extra_flags)
+        PSRFOLD_PULSARX(fold_input_psrfold, params.psrfold_nbin, params.psrfold_nsubint, params.coherent_dm, params.psrfold_extra_flags)
     } else {
-        // PREPFOLD: Parse each sifted candidate file line-by-line
-        // Create one PREPFOLD job per candidate (per line in each candfile)
+        // PREPFOLD: one job per candidate (per line in each sifted candfile)
         // candfile format: #id dm acc F0 F1 F2 S/N
-
-        // Parse each candfile line-by-line
         top_candidates = ACCELSIFT.out.sifted_candidates
-            .flatMap { segment_label, start_frac, end_frac, candfile ->
-                // Read the file and parse each line (skip header)
+            .flatMap { obs_id, segment_label, start_frac, end_frac, candfile ->
                 candfile.splitCsv(sep: '\t', skip: 1).collect { row ->
-                    [segment_label, start_frac, end_frac, row]
+                    [obs_id, segment_label, start_frac, end_frac, row]
                 }
             }
-            .map { segment_label, start_frac, end_frac, row ->
+            .map { obs_id, segment_label, start_frac, end_frac, row ->
                 def cand_id = row[0] as Integer
-                def dm = row[1] as Double
-                def acc = row[2] as Double
+                def cand_dm = row[1] as Double
                 def f0 = row[3] as Double
                 def f1 = row[4] as Double
                 def f2 = row[5] as Double
-                def snr = row[6] as Double
-                [segment_label, start_frac, end_frac, cand_id, dm, f0, f1, f2]
+                [obs_id, segment_label, start_frac, end_frac, cand_id, cand_dm, f0, f1, f2]
             }
 
-        // Combine with observation and RFI products
+        // Join each candidate with its own observation and RFI products
         fold_input_prepfold = RFIFIND.out.rfi_products
-            .map { obs, rfi_products, original_basename -> [obs, rfi_products] }
-            .combine(top_candidates)
+            .combine(top_candidates, by: 0)
+            .map { obs_id, obs, rfi_products, segment_label, start_frac, end_frac, cand_id, cand_dm, f0, f1, f2 ->
+                [obs_id, obs, rfi_products, segment_label, start_frac, end_frac, cand_id, cand_dm, f0, f1, f2]
+            }
 
         PREPFOLD_FROM_CANDFILE(fold_input_prepfold, params.npart, params.prepfold_extra_flags)
     }
 
-    // Step 14: Optional single pulse search (on DM trials without nobary)
+    // Step 10: Optional single pulse search (on barycentered DM trials)
     if (params.enable_single_pulse) {
         SINGLE_PULSE_SEARCH(
             PREPDATA_DMTRIALS.out.timeseries,

@@ -142,8 +142,12 @@ def main():
         print(f"  Removed {before - len(cands)} candidates")
         print(f"  Remaining: {len(cands)} candidates")
 
-    # Remove harmonically related candidates
-    if args.remove_harmonics and len(cands):
+    # Remove harmonically related candidates.
+    # Needs at least 2 candidates: PRESTO's remove_harmonics compares the only
+    # candidate against itself (factor 1.0 always matches), marks it bad, then
+    # indexes the now-empty list and raises IndexError. With one candidate
+    # there is nothing to be a harmonic of, so skipping is also correct.
+    if args.remove_harmonics and len(cands) > 1:
         print(f"\nRemoving harmonic candidates...")
         before = len(cands)
         cands = sifting.remove_harmonics(cands)
@@ -156,8 +160,12 @@ def main():
         open(args.fold_params, 'w').close()
         return
 
-    # Sort by sigma (descending)
+    # Sort by sigma (descending) and keep only the top candidates
     cands.sort(key=attrgetter('sigma'), reverse=True)
+    if args.max_cands_to_fold > 0 and len(cands) > args.max_cands_to_fold:
+        print(f"\nKeeping the top {args.max_cands_to_fold} of {len(cands)} candidates "
+              "(--max-cands-to-fold)")
+        cands = cands[:args.max_cands_to_fold]
 
     # Determine observation time (needed for z to accel conversion)
     if args.tobs is not None:
